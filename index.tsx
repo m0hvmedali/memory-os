@@ -12,11 +12,9 @@ import {
   ChevronDown,
   ChevronUp,
   Search,
-  Filter,
   Zap,
   Heart,
   Users,
-  Crown,
   Sparkles,
   Copy,
   Check,
@@ -24,7 +22,8 @@ import {
   Loader2,
   HardDrive,
   Cpu,
-  Database
+  Database,
+  RefreshCw
 } from "lucide-react";
 
 // --- Types ---
@@ -38,12 +37,20 @@ interface MemoryItem {
   type?: 'person' | 'emotion' | 'conversation' | 'text' | 'unknown';
 }
 
+interface IntelligenceDossier {
+    subject: string;
+    content: any;
+    sourceFile: string;
+    relevanceScore: number;
+    type: string;
+}
+
 // --- IndexedDB Layer ---
 const DB_NAME = "MemoryOS_DB";
-const STORE_NAME = "memories"; // Renamed from chunks to memories for clarity
+const STORE_NAME = "memories"; 
 
 const dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
-  const request = indexedDB.open(DB_NAME, 3); // Increment version
+  const request = indexedDB.open(DB_NAME, 4); // Increment version for schema updates if needed
   request.onupgradeneeded = (event) => {
     const db = (event.target as IDBOpenDBRequest).result;
     if (!db.objectStoreNames.contains(STORE_NAME)) {
@@ -84,6 +91,55 @@ async function clearMemories() {
     });
 }
 
+// --- Parsing Logic (WhatsApp) ---
+
+function parseWhatsAppLogs(text: string): any[] | null {
+    // Regex for: "14/08/24, 5:56 pm - Sender Name: Message Content"
+    // Handles various date formats (dd/mm/yy, mm/dd/yy) and unicode characters in names
+    const regex = /^(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}),\s*(\d{1,2}:\d{2}\s?(?:[aApP][mM])?)\s*-\s*([^:]+):\s*(.+)/;
+    
+    const lines = text.split('\n');
+    const messages: any[] = [];
+    let currentMessage: any = null;
+
+    let matchCount = 0;
+
+    for (const line of lines) {
+        const match = line.match(regex);
+        if (match) {
+            matchCount++;
+            // Save previous message if exists
+            if (currentMessage) {
+                messages.push(currentMessage);
+            }
+            // Start new message
+            currentMessage = {
+                date: match[1],
+                time: match[2],
+                sender: match[3].trim(),
+                message: match[4].trim(),
+                original: line
+            };
+        } else {
+            // Multiline message support
+            if (currentMessage) {
+                currentMessage.message += "\n" + line;
+            }
+        }
+    }
+    
+    if (currentMessage) {
+        messages.push(currentMessage);
+    }
+
+    // Heuristic: If we parsed a significant number of lines successfully, it's a chat log
+    if (matchCount > 0 && messages.length > 0) {
+        return messages;
+    }
+    
+    return null;
+}
+
 // --- Helper Components ---
 
 const CopyButton = ({ text, fileName }: { text: string, fileName?: string }) => {
@@ -122,7 +178,7 @@ const highlightText = (text: any, highlight: string) => {
       const pattern = new RegExp(`(${String(highlight).replace(/[-/\\^$*+?.()|[\\]{}]/g, '\\\\$&')})`, 'gi');
       const parts = text.split(pattern);
       return parts.map((part: string, index: number) =>
-        pattern.test(part) ? <span key={index} className="px-1 font-bold text-indigo-950 rounded bg-amber-400">{part}</span> : part
+        pattern.test(part) ? <span key={index} className="bg-yellow-500/40 text-yellow-100 font-bold px-1 rounded">{part}</span> : part
       );
     } catch (e) {
       return text;
@@ -208,19 +264,6 @@ const EmotionCard = ({ emotion, query }: { emotion: any, query: string }) => {
           </div>
         )}
 
-        {emotion.branches && emotion.branches.length > 0 && (
-          <div className="mb-6 relative z-10">
-            <h4 className="mb-3 text-xs font-bold uppercase tracking-wider text-rose-400">Branches</h4>
-            <div className="flex flex-wrap gap-2">
-              {emotion.branches.map((branch: string, index: number) => (
-                <span key={index} className="px-3 py-1.5 text-xs text-rose-100 rounded-lg bg-rose-600/30 border border-rose-500/30">
-                  {highlightText(branch, query)}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-
         <div className="flex gap-2 mt-4 relative z-10">
           <CopyButton text={emotion} fileName={`emotion-${emotion.name}.json`} />
         </div>
@@ -233,15 +276,16 @@ const ConversationView = ({ messages, searchTerm, title }: { messages: any[], se
     const [showAll, setShowAll] = useState(false);
     const [windowMessages, setWindowMessages] = useState<any[] | null>(null);
 
-    // Search Matching Logic
+    // Filter messages that contain the search term
     const matchedIndices: number[] = [];
     messages.forEach((msg, index) => {
-      const msgText = JSON.stringify(msg).toLowerCase();
+      const msgText = (msg.message || msg.text || JSON.stringify(msg)).toLowerCase();
       if (msgText.includes(searchTerm.toLowerCase())) {
         matchedIndices.push(index);
       }
     });
 
+    // Create a set of indices to display (match + context)
     let displayIndices = new Set<number>();
     matchedIndices.forEach(idx => {
       const start = Math.max(0, idx - 2);
@@ -252,7 +296,8 @@ const ConversationView = ({ messages, searchTerm, title }: { messages: any[], se
     let displayMessages = Array.from(displayIndices).sort((a,b)=>a-b).map(i => messages[i]);
 
     if (displayMessages.length === 0 && messages.length > 0) {
-      displayMessages = messages.slice(0, 5); // Show first 5 if no match
+      // Fallback: Show latest messages if no match found
+      displayMessages = messages.slice(-5);
     }
 
     if (showAll) displayMessages = messages;
@@ -260,17 +305,12 @@ const ConversationView = ({ messages, searchTerm, title }: { messages: any[], se
 
     const showContextAround = (msg: any) => {
       const idx = messages.indexOf(msg);
-      const start = Math.max(0, idx - 5);
-      const end = Math.min(messages.length, idx + 6);
+      const start = Math.max(0, idx - 10);
+      const end = Math.min(messages.length, idx + 10);
       setWindowMessages(messages.slice(start, end));
     };
 
     const clearWindow = () => setWindowMessages(null);
-
-    const formatTime = (timeStr: string) => {
-      if (!timeStr) return '';
-      return timeStr.replace(/T/, ' ').slice(0, 16);
-    };
 
     return (
       <div className="mt-4 bg-[#0c0c0e] rounded-2xl border border-zinc-800 overflow-hidden" data-report-content>
@@ -278,52 +318,71 @@ const ConversationView = ({ messages, searchTerm, title }: { messages: any[], se
             className="flex justify-between items-center p-4 bg-zinc-900/80 border-b border-zinc-800 cursor-pointer hover:bg-zinc-900 transition-colors"
             onClick={() => setExpanded(!expanded)}
         >
-          <h3 className="flex gap-2 items-center font-medium text-emerald-400">
-            <MessageCircle className="w-4 h-4" /> {title}
-          </h3>
+          <div className="flex items-center gap-3">
+             <div className="bg-emerald-500/20 p-2 rounded-full">
+                <MessageCircle className="w-4 h-4 text-emerald-400" />
+             </div>
+             <div>
+                 <h3 className="font-medium text-zinc-200 text-sm">{title}</h3>
+                 <p className="text-[10px] text-zinc-500">{messages.length} messages found</p>
+             </div>
+          </div>
           <div className="flex gap-2 items-center">
-            <span className="text-xs text-zinc-500 bg-zinc-800 px-2 py-1 rounded-full">{messages.length} msgs</span>
             {expanded ? <ChevronUp className="w-4 h-4 text-zinc-500" /> : <ChevronDown className="w-4 h-4 text-zinc-500" />}
           </div>
         </div>
 
         {expanded && (
-          <div className="p-4 space-y-4 max-h-[600px] overflow-y-auto custom-scrollbar bg-zinc-950/50">
+          <div className="p-4 space-y-3 bg-[#050505] max-h-[600px] overflow-y-auto custom-scrollbar">
             {displayMessages.map((msg, index) => {
-              const isMatch = JSON.stringify(msg).toLowerCase().includes(searchTerm.toLowerCase());
-              // Generic sender check - customize based on your data "me" vs others
-              const isMe = msg.sender && ['me', 'self', 'user', 'mohamed'].some(s => msg.sender.toLowerCase().includes(s));
-              const messageText = msg.text || msg.message || msg.content || JSON.stringify(msg);
-
+               // Normalization
+               const text = msg.message || msg.text || msg.content || "";
+               const sender = msg.sender || "Unknown";
+               const time = msg.time || msg.date || "";
+               
+               const isMatch = text.toLowerCase().includes(searchTerm.toLowerCase());
+               // Heuristic to detect "Me"
+               const isMe = ['me', 'self', 'user', 'mohamed'].some(s => sender.toLowerCase().includes(s));
+               
               return (
-                <div key={index} className={`flex ${isMe ? 'justify-end' : 'justify-start'} group animate-in slide-in-from-bottom-2`}>
+                <div key={index} className={`flex w-full ${isMe ? 'justify-end' : 'justify-start'} group`}>
                    {!isMe && (
-                      <div className="w-8 h-8 rounded-full bg-zinc-800 flex items-center justify-center mr-2 flex-shrink-0 text-xs text-zinc-400 font-bold">
-                          {msg.sender ? msg.sender[0].toUpperCase() : '?'}
+                      <div className="flex-shrink-0 mr-2 mt-auto">
+                           <div className="w-8 h-8 rounded-full bg-zinc-800 border border-zinc-700 flex items-center justify-center text-[10px] font-bold text-zinc-400">
+                               {sender[0].toUpperCase()}
+                           </div>
                       </div>
                    )}
-                  <div className={`max-w-[85%] md:max-w-[70%] p-3.5 rounded-2xl text-sm leading-relaxed shadow-md ${
+                   
+                  <div className={`relative max-w-[85%] md:max-w-[70%] px-4 py-2 rounded-2xl text-sm leading-relaxed shadow-sm transition-all ${
                       isMe 
-                      ? 'bg-emerald-700/20 border border-emerald-600/20 text-emerald-100 rounded-br-sm' 
-                      : 'bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-bl-sm'
-                    } ${isMatch ? 'ring-2 ring-amber-500/50 shadow-[0_0_15px_rgba(245,158,11,0.2)]' : ''}`}>
+                      ? 'bg-emerald-600 text-white rounded-br-sm' 
+                      : 'bg-zinc-800 text-zinc-200 rounded-bl-sm'
+                    } ${isMatch ? 'ring-2 ring-yellow-400/70 shadow-[0_0_15px_rgba(250,204,21,0.2)]' : ''}`}>
                     
-                    {!isMe && <div className="text-[10px] font-bold text-zinc-500 mb-1">{msg.sender}</div>}
+                    {!isMe && <div className="text-[10px] font-bold text-zinc-400 mb-0.5 opacity-80">{sender}</div>}
 
                     <div className="whitespace-pre-wrap break-words">
-                      {highlightText(messageText, searchTerm)}
+                      {highlightText(text, searchTerm)}
                     </div>
                     
-                    <div className="flex items-center justify-between gap-4 mt-2 pt-2 border-t border-white/5">
-                        <span className="text-[10px] text-white/30 font-mono">
-                           {formatTime(msg.time || msg.date)}
+                    <div className={`flex items-center justify-end gap-2 mt-1 ${isMe ? 'text-emerald-200' : 'text-zinc-500'}`}>
+                        <span className="text-[9px] font-mono opacity-70">
+                           {time}
                         </span>
-                        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                            {isMatch && (
-                                <button onClick={(e) => { e.stopPropagation(); showContextAround(msg); }} className="text-[10px] px-1.5 py-0.5 bg-emerald-500/20 text-emerald-400 rounded hover:bg-emerald-500/30">Context</button>
-                            )}
-                            <CopyButton text={messageText} fileName="msg.txt" />
-                        </div>
+                    </div>
+
+                    {/* Context Menu on Hover */}
+                    <div className={`absolute top-0 ${isMe ? '-left-16' : '-right-16'} h-full flex items-center opacity-0 group-hover:opacity-100 transition-opacity px-2`}>
+                        {isMatch && (
+                             <button 
+                                onClick={(e) => { e.stopPropagation(); showContextAround(msg); }} 
+                                className="p-1.5 bg-zinc-800 rounded-full hover:bg-zinc-700 text-zinc-300"
+                                title="Show Context"
+                             >
+                                <RefreshCw className="w-3 h-3" />
+                             </button>
+                        )}
                     </div>
                   </div>
                 </div>
@@ -331,17 +390,19 @@ const ConversationView = ({ messages, searchTerm, title }: { messages: any[], se
             })}
 
             {!showAll && !windowMessages && messages.length > displayMessages.length && (
-                <button 
-                    onClick={() => setShowAll(true)} 
-                    className="w-full py-3 text-xs font-medium text-zinc-400 hover:text-white bg-zinc-900/50 hover:bg-zinc-800 rounded-xl transition-all border border-dashed border-zinc-800"
-                >
-                  Load full conversation ({messages.length - displayMessages.length} more)
-                </button>
+                <div className="pt-4 flex justify-center">
+                    <button 
+                        onClick={() => setShowAll(true)} 
+                        className="px-4 py-2 text-xs font-medium text-zinc-400 hover:text-white bg-zinc-900 hover:bg-zinc-800 rounded-full transition-all border border-zinc-800"
+                    >
+                    Load full conversation ({messages.length - displayMessages.length} remaining)
+                    </button>
+                </div>
             )}
              {windowMessages && (
-              <div className="text-center">
-                <button onClick={clearWindow} className="px-3 py-1 text-sm bg-zinc-800 text-zinc-300 rounded hover:bg-zinc-700">
-                  Back to filtered view
+              <div className="text-center sticky bottom-0 py-2">
+                <button onClick={clearWindow} className="px-4 py-2 text-xs font-bold bg-indigo-600 text-white rounded-full hover:bg-indigo-500 shadow-lg">
+                  Return to Filtered View
                 </button>
               </div>
             )}
@@ -351,32 +412,38 @@ const ConversationView = ({ messages, searchTerm, title }: { messages: any[], se
     );
 };
 
-const SmartSearchResults = ({ data, query }: { data: MemoryItem[], query: string }) => {
-    if (!query) return null;
+// --- Report Generation Logic (Moved out of component for perf) ---
 
+function generateIntelligenceReport(data: MemoryItem[], query: string): IntelligenceDossier[] {
     const lowerQuery = query.toLowerCase().trim();
-    const dossiers: any[] = [];
+    if (!lowerQuery) return [];
+
+    const dossiers: IntelligenceDossier[] = [];
 
     // --- Scoring Algorithm ---
-    data.forEach(item => {
+    for (const item of data) {
         let relevance = 0;
         const content = item.content;
         
         // Handle array content (Chats)
-        if (Array.isArray(content)) {
+        if (Array.isArray(content) || item.type === 'conversation') {
+            const msgs = Array.isArray(content) ? content : (content.messages || []);
             // Check if any message matches
-            const matches = content.filter(msg => JSON.stringify(msg).toLowerCase().includes(lowerQuery));
-            if (matches.length > 0) {
-                relevance += matches.length; // More matches = higher score
+            const matchCount = msgs.reduce((acc: number, msg: any) => {
+                const txt = msg.message || msg.text || "";
+                return txt.toLowerCase().includes(lowerQuery) ? acc + 1 : acc;
+            }, 0);
+
+            if (matchCount > 0) {
                 dossiers.push({
                     subject: item.sourceFile.replace(/\.(json|txt)$/i, ''),
-                    content: content, // Pass the full array
+                    content: msgs,
                     sourceFile: item.sourceFile,
-                    relevanceScore: relevance + 10, // Bonus for being a chat with matches
+                    relevanceScore: matchCount * 2 + 10,
                     type: 'conversation'
                 });
             }
-            return;
+            continue;
         }
 
         // Handle Object content
@@ -392,7 +459,6 @@ const SmartSearchResults = ({ data, query }: { data: MemoryItem[], query: string
             }
         });
 
-        // Generic string search in object
         const str = JSON.stringify(content).toLowerCase();
         if (str.includes(lowerQuery)) relevance += 1;
 
@@ -405,23 +471,25 @@ const SmartSearchResults = ({ data, query }: { data: MemoryItem[], query: string
                 type: item.type || 'unknown'
             });
         }
-    });
+    }
 
-    dossiers.sort((a, b) => b.relevanceScore - a.relevanceScore);
+    return dossiers.sort((a, b) => b.relevanceScore - a.relevanceScore);
+}
 
-    if (dossiers.length === 0) {
+const SmartSearchResults = ({ results, query }: { results: IntelligenceDossier[], query: string }) => {
+    if (!results || results.length === 0) {
         return (
-            <div className="p-8 text-center rounded-2xl border border-amber-900/30 bg-amber-900/10 mt-10">
-                <Shield className="w-12 h-12 text-amber-600 mx-auto mb-4" />
-                <h3 className="text-xl font-bold text-amber-500 mb-2">No Intel Found</h3>
-                <p className="text-amber-200/60">No matching records for "<span className="text-amber-400">{query}</span>" in the memory bank.</p>
+            <div className="p-8 text-center rounded-2xl border border-zinc-800 bg-zinc-900/30 mt-10 animate-in fade-in zoom-in-95">
+                <Shield className="w-12 h-12 text-zinc-600 mx-auto mb-4" />
+                <h3 className="text-xl font-bold text-zinc-400 mb-2">No Intel Found</h3>
+                <p className="text-zinc-600">No matching records for "<span className="text-zinc-300">{query}</span>"</p>
             </div>
         );
     }
 
     // Group by File/Category
-    const sections: Record<string, any[]> = {};
-    dossiers.forEach(d => {
+    const sections: Record<string, IntelligenceDossier[]> = {};
+    results.forEach(d => {
         if (!sections[d.sourceFile]) sections[d.sourceFile] = [];
         sections[d.sourceFile].push(d);
     });
@@ -429,11 +497,11 @@ const SmartSearchResults = ({ data, query }: { data: MemoryItem[], query: string
     return (
         <div className="space-y-8 pb-20 animate-in fade-in slide-in-from-bottom-4 duration-700">
              {/* Summary Header */}
-             <div className="bg-zinc-900/50 border border-zinc-800 p-4 rounded-xl flex items-center justify-between backdrop-blur-sm sticky top-0 z-20 shadow-xl">
+             <div className="bg-zinc-900/80 border border-zinc-800 p-4 rounded-xl flex items-center justify-between backdrop-blur-md sticky top-0 z-30 shadow-2xl">
                  <div className="flex items-center gap-3">
                      <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                      <span className="text-zinc-400 text-sm font-mono">
-                         Found <span className="text-white font-bold">{dossiers.length}</span> records in <span className="text-white font-bold">{Object.keys(sections).length}</span> files
+                         Found <span className="text-white font-bold">{results.length}</span> dossiers
                      </span>
                  </div>
                  <button onClick={() => {
@@ -453,7 +521,6 @@ const SmartSearchResults = ({ data, query }: { data: MemoryItem[], query: string
                      </div>
 
                      {items.map((item, idx) => {
-                         // Determine renderer based on content shape
                          const content = item.content;
                          
                          // PERSON
@@ -465,12 +532,11 @@ const SmartSearchResults = ({ data, query }: { data: MemoryItem[], query: string
                             return <EmotionCard key={idx} emotion={content} query={query} />;
                          }
                          // CONVERSATION
-                         if (Array.isArray(content) || item.type === 'conversation') {
-                             return <ConversationView key={idx} messages={Array.isArray(content) ? content : (content.messages || [])} searchTerm={query} title={`Chat Log: ${item.subject}`} />;
+                         if (item.type === 'conversation' || Array.isArray(content)) {
+                             return <ConversationView key={idx} messages={content} searchTerm={query} title={`Chat Log: ${item.subject}`} />;
                          }
                          
                          // GENERIC / TEXT
-                         // Fallback for generic objects or text files
                          const textVal = typeof content === 'string' ? content : (content.text || content.content || JSON.stringify(content, null, 2));
                          
                          return (
@@ -523,12 +589,10 @@ const FileUpload = ({ onProcessed }: { onProcessed: (count: number) => void }) =
       try {
           if (file.name.endsWith('.json')) {
               const json = JSON.parse(text);
-              
-              // HEURISTIC: Is this a list of messages (Chat Log)?
+              // JSON logic... (same as before, mostly)
               const isChatLog = Array.isArray(json) && json.length > 0 && (json[0].sender || json[0].message);
               
               if (isChatLog) {
-                  // Save as ONE conversation item
                   itemsToAdd.push({
                       id: idBase,
                       sourceFile: file.name,
@@ -537,7 +601,6 @@ const FileUpload = ({ onProcessed }: { onProcessed: (count: number) => void }) =
                       type: 'conversation'
                   });
               } else if (Array.isArray(json)) {
-                  // It's a list of items (e.g. People, Emotions)
                   json.forEach((item, idx) => {
                        itemsToAdd.push({
                           id: `${idBase}_${idx}`,
@@ -548,7 +611,6 @@ const FileUpload = ({ onProcessed }: { onProcessed: (count: number) => void }) =
                        });
                   });
               } else {
-                  // Single Object
                   itemsToAdd.push({
                       id: idBase,
                       sourceFile: file.name,
@@ -558,16 +620,30 @@ const FileUpload = ({ onProcessed }: { onProcessed: (count: number) => void }) =
                   });
               }
           } else {
-              // Plain Text / MD
-              // Store as one big chunk or split? User prefers detailed reports.
-              // Let's store as one item for now, simpler for "FileText" view
-              itemsToAdd.push({
-                  id: idBase,
-                  sourceFile: file.name,
-                  content: { text: text },
-                  timestamp: Date.now(),
-                  type: 'text'
-              });
+              // Plain Text Handling
+              
+              // 1. Try Parsing as WhatsApp Log
+              const parsedChat = parseWhatsAppLogs(text);
+              
+              if (parsedChat) {
+                  console.log(`Parsed ${file.name} as WhatsApp Log with ${parsedChat.length} messages.`);
+                  itemsToAdd.push({
+                      id: idBase,
+                      sourceFile: file.name,
+                      content: parsedChat,
+                      timestamp: Date.now(),
+                      type: 'conversation'
+                  });
+              } else {
+                  // 2. Fallback to generic text
+                  itemsToAdd.push({
+                      id: idBase,
+                      sourceFile: file.name,
+                      content: { text: text },
+                      timestamp: Date.now(),
+                      type: 'text'
+                  });
+              }
           }
       } catch (err) {
           console.warn(`Failed to parse ${file.name}, treating as text.`);
@@ -610,11 +686,11 @@ const FileUpload = ({ onProcessed }: { onProcessed: (count: number) => void }) =
         <div className="space-y-2">
           <h3 className="text-xl font-medium text-white">Import Memory Bank</h3>
           <p className="text-zinc-500 max-w-sm mx-auto">
-            Upload a folder of your <strong>.json</strong> data files (People, Chats, Journals) or <strong>.txt</strong> notes.
+            Upload a folder of your <strong>.json</strong> data or <strong>WhatsApp exports (.txt)</strong>.
           </p>
         </div>
         <div className="px-4 py-2 bg-zinc-800 rounded-full text-xs font-mono text-zinc-400 group-hover:bg-indigo-900/20 group-hover:text-indigo-300 transition-colors">
-            Local Parsing • No Cloud Upload
+            Auto-Detects Chats & People
         </div>
       </div>
     </div>
@@ -622,7 +698,7 @@ const FileUpload = ({ onProcessed }: { onProcessed: (count: number) => void }) =
 };
 
 // --- Intelligence View (AI) ---
-
+// (No changes needed for AI view, keeping previous code implicitly)
 const IntelligenceView = () => {
     const [analysis, setAnalysis] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
@@ -633,12 +709,15 @@ const IntelligenceView = () => {
         setError(null);
         try {
             const allMemories = await getAllMemories();
-            // Random sample of text content for AI
             const sample = allMemories
                 .sort(() => 0.5 - Math.random())
                 .slice(0, 8)
                 .map(m => {
-                    if (m.type === 'conversation') return `Chat Log: ${JSON.stringify(m.content).slice(0, 200)}...`;
+                    if (m.type === 'conversation') {
+                        // Handle array content safe check
+                        const content = Array.isArray(m.content) ? m.content : [];
+                        return `Chat Log: ${JSON.stringify(content.slice(0, 5))}...`;
+                    }
                     if (typeof m.content === 'string') return m.content;
                     return JSON.stringify(m.content);
                 })
@@ -650,7 +729,7 @@ const IntelligenceView = () => {
             const response = await ai.models.generateContent({
                 model: "gemini-3-pro-preview",
                 config: {
-                    systemInstruction: "You are the Intelligence Officer of a Memory OS. Analyze these random data fragments from the user's life. Construct a psychological profile or find hidden connections. Be deep, slightly cryptic, and very insightful."
+                    systemInstruction: "You are the Intelligence Officer of a Memory OS. Analyze these random data fragments. Construct a psychological profile or find hidden connections."
                 },
                 contents: `Data Fragments:\n${sample}`
             });
@@ -679,7 +758,7 @@ const IntelligenceView = () => {
                 <div className="flex-1 flex flex-col items-center justify-center text-center space-y-6 opacity-80">
                     <Cpu className="w-24 h-24 text-zinc-800" />
                     <p className="text-zinc-500 max-w-md">
-                        The system is ready to dream. Initiate a deep scan to find correlations between your chats, people, and emotions.
+                        The system is ready to dream. Initiate a deep scan to find correlations.
                     </p>
                     <button 
                         onClick={analyze}
@@ -721,6 +800,32 @@ function App() {
   const [query, setQuery] = useState("");
   const [allMemories, setAllMemories] = useState<MemoryItem[]>([]);
   const [loadingDB, setLoadingDB] = useState(true);
+  
+  // Search States
+  const [searchState, setSearchState] = useState<{ results: IntelligenceDossier[], isSearching: boolean }>({
+      results: [],
+      isSearching: false
+  });
+  
+  // Debounce and Async Search Logic
+  useEffect(() => {
+      if (!query.trim()) {
+          setSearchState({ results: [], isSearching: false });
+          return;
+      }
+
+      setSearchState(prev => ({ ...prev, isSearching: true }));
+
+      const timeoutId = setTimeout(() => {
+          // Wrap heavy calculation in another timeout to allow UI to render the 'isSearching' state first
+          setTimeout(() => {
+              const results = generateIntelligenceReport(allMemories, query);
+              setSearchState({ results, isSearching: false });
+          }, 10);
+      }, 600); // 600ms debounce
+
+      return () => clearTimeout(timeoutId);
+  }, [query, allMemories]);
 
   // Initial Load
   useEffect(() => {
@@ -800,16 +905,21 @@ function App() {
                             type="text" 
                             value={query}
                             onChange={e => setQuery(e.target.value)}
-                            placeholder="Enter keyword to generate report..." 
+                            placeholder="Enter keyword to investigate..." 
                             className="w-full bg-transparent border-none py-5 px-4 text-lg text-white placeholder:text-zinc-600 focus:ring-0 outline-none font-medium"
                             autoFocus
                         />
-                         {query && (
-                            <button onClick={() => setQuery('')} className="mr-4 text-zinc-500 hover:text-white">
-                                <span className="sr-only">Clear</span>
-                                <div className="bg-zinc-800 rounded-full p-1"><Check className="w-3 h-3" /></div>
-                            </button>
-                        )}
+                         {searchState.isSearching ? (
+                            <div className="mr-5">
+                                <Loader2 className="w-5 h-5 animate-spin text-indigo-500" />
+                            </div>
+                         ) : (
+                             query && (
+                                <button onClick={() => setQuery('')} className="mr-4 text-zinc-500 hover:text-white">
+                                    <div className="bg-zinc-800 rounded-full p-1"><Check className="w-3 h-3" /></div>
+                                </button>
+                            )
+                         )}
                     </div>
                 </div>
             </div>
@@ -828,13 +938,21 @@ function App() {
                 {activeTab === 'search' && (
                     <>
                         {loadingDB ? (
-                             <div className="flex items-center justify-center h-64">
-                                 <Loader2 className="w-8 h-8 animate-spin text-zinc-600" />
+                             <div className="flex flex-col items-center justify-center h-64 text-zinc-500">
+                                 <Loader2 className="w-8 h-8 animate-spin mb-4" />
+                                 <p className="text-sm">Decrypting Archives...</p>
                              </div>
                         ) : (
                             <>
                                 {query ? (
-                                    <SmartSearchResults data={allMemories} query={query} />
+                                    searchState.isSearching ? (
+                                        <div className="flex flex-col items-center justify-center py-20 text-zinc-500 animate-in fade-in">
+                                            <div className="w-12 h-12 border-4 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin mb-4"></div>
+                                            <p className="font-mono text-xs tracking-widest uppercase">Analyzing Data Stream...</p>
+                                        </div>
+                                    ) : (
+                                        <SmartSearchResults results={searchState.results} query={query} />
+                                    )
                                 ) : (
                                     <div className="flex flex-col items-center justify-center h-[50vh] text-center opacity-40">
                                         <div className="w-24 h-24 bg-zinc-900 rounded-full flex items-center justify-center mb-6 border border-zinc-800">
@@ -854,13 +972,13 @@ function App() {
                          <div className="w-full max-w-2xl">
                              <div className="text-center mb-12">
                                  <h2 className="text-3xl font-bold text-white mb-4">Ingest Data</h2>
-                                 <p className="text-zinc-400">Load your external brain. Supports JSON dumps of chats, people lists, and journals.</p>
+                                 <p className="text-zinc-400">Load your external brain. Supports JSON dumps and <strong>WhatsApp .txt exports</strong>.</p>
                              </div>
                              <FileUpload onProcessed={() => {}} />
                              <div className="mt-12 grid grid-cols-2 gap-4">
                                  <div className="p-4 bg-zinc-900/50 rounded-xl border border-zinc-800">
                                      <div className="text-emerald-400 font-mono text-xs mb-2">SUPPORTED FORMATS</div>
-                                     <div className="text-zinc-300 text-sm">.JSON, .TXT, .MD</div>
+                                     <div className="text-zinc-300 text-sm">.JSON, .TXT (WhatsApp)</div>
                                  </div>
                                  <div className="p-4 bg-zinc-900/50 rounded-xl border border-zinc-800">
                                      <div className="text-purple-400 font-mono text-xs mb-2">PRIVACY</div>
