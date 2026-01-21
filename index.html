@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <meta name="theme-color" content="#09090b" />
     <meta name="description" content="Memory OS - Your External Brain" />
     <title>Memory OS</title>
@@ -18,6 +18,9 @@
               zinc: {
                 950: '#09090b',
               }
+            },
+            screens: {
+              'xs': '375px',
             }
           }
         }
@@ -34,6 +37,7 @@
         color: #e4e4e7; /* Zinc 200 */
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         overflow: hidden; /* App handles scrolling */
+        -webkit-tap-highlight-color: transparent;
       }
       #root {
         height: 100%;
@@ -42,6 +46,7 @@
       /* Custom scrollbar for webkit */
       .custom-scrollbar::-webkit-scrollbar {
         width: 6px;
+        height: 6px;
       }
       .custom-scrollbar::-webkit-scrollbar-track {
         background: transparent;
@@ -49,6 +54,14 @@
       .custom-scrollbar::-webkit-scrollbar-thumb {
         background-color: #27272a;
         border-radius: 20px;
+      }
+      /* Hide scrollbar for horizontal nav */
+      .no-scrollbar::-webkit-scrollbar {
+        display: none;
+      }
+      .no-scrollbar {
+        -ms-overflow-style: none;
+        scrollbar-width: none;
       }
     </style>
   <script type="importmap">
