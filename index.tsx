@@ -79,7 +79,10 @@ import {
   Type
 } from "lucide-react";
 
-// --- Types ---
+// --- Types & Globals ---
+
+// Fix: Removed conflicting global Window declaration for aistudio.
+// Using type assertion (window as any).aistudio where needed to avoid type conflicts.
 
 interface MemoryItem {
   id: string;
@@ -1487,12 +1490,14 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   
+  // Authorization State for Google AI Studio Environment
+  const [hasApiAccess, setHasApiAccess] = useState(false);
+  
   // Vector Store State (Shared between Analytics and Intelligence)
   const [vectorStore, setVectorStore] = useState<VectorItem[]>([]);
   const [isLoadingVectors, setIsLoadingVectors] = useState(false);
 
   // Settings State
-  const [apiKey, setApiKey] = useState(process.env.API_KEY || "");
   const [userName, setUserName] = useState("User");
   
   // Supabase State
@@ -1501,6 +1506,22 @@ function App() {
       key: "",
       enabled: false
   });
+
+  // --- API Key Authorization Check ---
+  useEffect(() => {
+    async function checkApiKey() {
+      // If we are in the Google AI Studio environment, we must check for the selected key
+      // Fix: Cast window to any to access aistudio to avoid type conflict
+      if (typeof window !== 'undefined' && (window as any).aistudio) {
+        const hasKey = await (window as any).aistudio.hasSelectedApiKey();
+        setHasApiAccess(hasKey);
+      } else {
+        // If not in that specific environment, assume process.env.API_KEY is handled by the build system/env
+        setHasApiAccess(true);
+      }
+    }
+    checkApiKey();
+  }, []);
 
   // --- Toast Logic ---
   const addToast = (type: ToastType, title: string, message: string) => {
@@ -1892,6 +1913,42 @@ function App() {
     }
   };
 
+  // Render API Key Selection Screen if needed
+  if (!hasApiAccess && typeof window !== 'undefined' && (window as any).aistudio) {
+    return (
+        <div className="flex flex-col items-center justify-center h-screen bg-zinc-950 text-white space-y-6 animate-fade-in p-6">
+            <div className="w-16 h-16 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                <Brain className="w-8 h-8 text-white" />
+            </div>
+            <h1 className="text-2xl font-light tracking-tight text-center">Memory OS</h1>
+            <p className="text-zinc-400 text-sm max-w-xs text-center leading-relaxed">
+                To activate your external brain and neural analysis, please connect your Google Gemini API key.
+            </p>
+            <button 
+                onClick={async () => {
+                    // Fix: Cast window to any to access aistudio
+                    const win = window as any;
+                    if (win.aistudio) {
+                        await win.aistudio.openSelectKey();
+                        const has = await win.aistudio.hasSelectedApiKey();
+                        if(has) {
+                            setHasApiAccess(true);
+                            window.location.reload(); 
+                        }
+                    }
+                }}
+                className="flex items-center gap-2 px-6 py-3 bg-white text-black rounded-full font-medium hover:scale-105 transition-transform shadow-xl shadow-white/10"
+            >
+                <Zap className="w-4 h-4 fill-black" />
+                Connect API Key
+            </button>
+            <a href="https://ai.google.dev/" target="_blank" className="text-xs text-zinc-600 hover:text-zinc-400 transition-colors">
+                What is this?
+            </a>
+        </div>
+    )
+  }
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-zinc-950 text-zinc-200 font-sans selection:bg-indigo-500/30">
       
@@ -1963,7 +2020,7 @@ function App() {
                 <span className="text-sm font-medium">Settings</span>
             </button>
             <div className="mt-4 px-4 text-[10px] text-zinc-600 font-mono text-center">
-                v1.2.0 • Local First
+                v1.2.1 • Local First
             </div>
         </div>
       </aside>
