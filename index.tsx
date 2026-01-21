@@ -2,11 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { createRoot } from "react-dom/client";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 // @ts-ignore
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.16.0/dist/transformers.min.js';
-
-// Configure transformers.js to not load from local path, but from CDN
-env.allowLocalModels = false;
-env.useBrowserCache = true;
+// Transformers import removed from main thread, moved to Worker
 
 import {
   Shield,
@@ -76,8 +72,87 @@ import {
   MicOff,
   Ear,
   Type,
-  ArrowRight
+  ArrowRight,
+  Bot
 } from "lucide-react";
+
+// --- Worker Script Definition ---
+// We define the worker code as a string to avoid needing a separate file build step
+const WORKER_CODE = `
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.16.0/dist/transformers.min.js';
+
+env.allowLocalModels = false;
+env.useBrowserCache = true;
+
+let embeddingPipeline = null;
+let vectorStore = []; // Keep a copy in worker for fast search
+
+self.onmessage = async (event) => {
+    const { type, payload, id } = event.data;
+
+    try {
+        if (type === 'init') {
+            if (!embeddingPipeline) {
+                embeddingPipeline = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+            }
+            self.postMessage({ type: 'init_complete', id });
+        } 
+        else if (type === 'load_vectors') {
+            // Load existing vectors into worker memory for fast search
+            vectorStore = payload;
+            self.postMessage({ type: 'load_complete', count: vectorStore.length, id });
+        }
+        else if (type === 'embed_chunk') {
+            if (!embeddingPipeline) throw new Error("Pipeline not initialized");
+            const output = await embeddingPipeline(payload.text, { pooling: 'mean', normalize: true });
+            const embedding = Array.from(output.data);
+            const vecItem = { ...payload, embedding };
+            
+            // Add to local store
+            vectorStore.push(vecItem);
+            
+            self.postMessage({ type: 'embed_result', payload: vecItem, id });
+        }
+        else if (type === 'search') {
+            if (!embeddingPipeline) throw new Error("Pipeline not initialized");
+            const { query, limit = 20 } = payload;
+            
+            // Embed query
+            const output = await embeddingPipeline(query, { pooling: 'mean', normalize: true });
+            const queryEmbedding = Array.from(output.data);
+
+            // Cosine Similarity
+            const results = vectorStore.map(vec => {
+                let dot = 0;
+                let normA = 0;
+                let normB = 0;
+                for (let i = 0; i < queryEmbedding.length; i++) {
+                    dot += queryEmbedding[i] * vec.embedding[i];
+                    normA += queryEmbedding[i] * queryEmbedding[i];
+                    normB += vec.embedding[i] * vec.embedding[i];
+                }
+                const score = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+                return { item: vec, score };
+            });
+
+            // Exact match boost
+            const lowerQuery = query.toLowerCase();
+            results.forEach(r => {
+                if (r.item.text.toLowerCase().includes(lowerQuery)) {
+                    r.score += 1.0; // Boost exact matches
+                }
+            });
+
+            // Sort
+            results.sort((a, b) => b.score - a.score);
+            
+            self.postMessage({ type: 'search_result', payload: results.slice(0, limit), id });
+        }
+    } catch (error) {
+        self.postMessage({ type: 'error', error: error.message, id });
+    }
+};
+`;
 
 // --- Types & Globals ---
 
@@ -127,7 +202,7 @@ interface VectorItem {
         source: string;
         timestamp: number;
         sender?: string;
-        originalId?: string; // Link back to original memory ID
+        originalId?: string; 
     };
 }
 
@@ -146,16 +221,20 @@ const NEGATIVE_WORDS = new Set(['كره', 'زعل', 'حزن', 'سيء', 'خرا'
 
 const MOODS = ['😐', '🙂', '😃', '😔', '😠', '😨', '😴', '🥰', '😎', '🧠'];
 
-// --- IndexedDB Layer ---
+// --- IndexedDB Layer (Updated for Vectors) ---
 const DB_NAME = "MemoryOS_DB";
 const STORE_NAME = "memories"; 
+const VECTOR_STORE_NAME = "vectors";
 
 const dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
-  const request = indexedDB.open(DB_NAME, 4); 
+  const request = indexedDB.open(DB_NAME, 5); // Version bumped
   request.onupgradeneeded = (event) => {
     const db = (event.target as IDBOpenDBRequest).result;
     if (!db.objectStoreNames.contains(STORE_NAME)) {
       db.createObjectStore(STORE_NAME, { keyPath: "id" });
+    }
+    if (!db.objectStoreNames.contains(VECTOR_STORE_NAME)) {
+        db.createObjectStore(VECTOR_STORE_NAME, { keyPath: "id" });
     }
   };
   request.onsuccess = () => resolve(request.result);
@@ -186,11 +265,7 @@ async function saveMemories(items: MemoryItem[], config?: SupabaseConfig) {
           type: item.type || 'unknown'
       }));
       const { error } = await sb.from('memories').upsert(rows);
-      if (error) {
-          if (error.message.includes('fetch')) throw new Error("Network Error: Could not connect to Supabase.");
-          if (error.code === '42501' || error.message.includes('JWT')) throw new Error("Permission Denied: Check API Key or Table Policies.");
-          throw new Error("Cloud Sync Failed: " + error.message);
-      }
+      if (error) throw new Error("Cloud Sync Failed: " + error.message);
       return;
   } else {
       try {
@@ -213,11 +288,7 @@ async function getAllMemories(config?: SupabaseConfig): Promise<MemoryItem[]> {
 
   if (sb) {
       const { data, error } = await sb.from('memories').select('*');
-      if (error) {
-           if (error.message.includes('fetch')) throw new Error("Network Error: Could not reach cloud database.");
-           if (error.code === 'PGRST116') throw new Error("Data Format Error: Unexpected response structure.");
-           throw new Error("Fetch Failed: " + error.message);
-      }
+      if (error) throw new Error("Fetch Failed: " + error.message);
       return (data || []).map((row: any) => ({
           id: row.id,
           sourceFile: row.source_file,
@@ -248,14 +319,34 @@ async function clearMemories(config?: SupabaseConfig) {
         if (error) throw new Error("Cloud Wipe Failed: " + error.message);
     } else {
         const db = await dbPromise;
-        const tx = db.transaction(STORE_NAME, "readwrite");
-        const store = tx.objectStore(STORE_NAME);
-        store.clear();
+        const tx = db.transaction([STORE_NAME, VECTOR_STORE_NAME], "readwrite");
+        tx.objectStore(STORE_NAME).clear();
+        tx.objectStore(VECTOR_STORE_NAME).clear();
         return new Promise<void>((resolve, reject) => {
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
         });
     }
+}
+
+async function saveVectors(items: VectorItem[]) {
+    const db = await dbPromise;
+    const tx = db.transaction(VECTOR_STORE_NAME, "readwrite");
+    const store = tx.objectStore(VECTOR_STORE_NAME);
+    items.forEach(item => store.put(item));
+    return new Promise<void>((resolve) => {
+        tx.oncomplete = () => resolve();
+    });
+}
+
+async function getAllVectors(): Promise<VectorItem[]> {
+    const db = await dbPromise;
+    const tx = db.transaction(VECTOR_STORE_NAME, "readonly");
+    const store = tx.objectStore(VECTOR_STORE_NAME);
+    return new Promise((resolve) => {
+        const req = store.getAll();
+        req.onsuccess = () => resolve(req.result);
+    });
 }
 
 // --- Parsing Logic ---
@@ -330,6 +421,46 @@ function parseBracketLogs(text: string): any[] | null {
     return null;
 }
 
+function parseGPTChatLog(text: string): any[] | null {
+    const lines = text.split('\n');
+    const messages: any[] = [];
+    let currentSender: string | null = null;
+    let currentBuffer: string[] = [];
+    let matchCount = 0;
+
+    for (const line of lines) {
+        const trimmed = line.trim().toLowerCase();
+        
+        // Check for specific headers in copy-pasted ChatGPT logs
+        if (trimmed === 'user') {
+            if (currentSender) {
+                messages.push({ sender: currentSender, message: currentBuffer.join('\n').trim(), date: null });
+                matchCount++;
+            }
+            currentSender = 'user';
+            currentBuffer = [];
+        } else if (trimmed === 'chatgpt') {
+            if (currentSender) {
+                messages.push({ sender: currentSender, message: currentBuffer.join('\n').trim(), date: null });
+                matchCount++;
+            }
+            currentSender = 'ChatGPT';
+            currentBuffer = [];
+        } else {
+            if (currentSender) {
+                currentBuffer.push(line);
+            }
+        }
+    }
+
+    if (currentSender && currentBuffer.length > 0) {
+        messages.push({ sender: currentSender, message: currentBuffer.join('\n').trim(), date: null });
+        matchCount++;
+    }
+
+    return matchCount > 0 ? messages : null;
+}
+
 function processFileContent(fileName: string, text: string): MemoryItem[] {
       const itemsToAdd: MemoryItem[] = [];
       const idBase = `${fileName}_${Date.now()}`;
@@ -375,6 +506,7 @@ function processFileContent(fileName: string, text: string): MemoryItem[] {
       try {
           const parsedBracketChat = parseBracketLogs(text);
           const parsedWhatsApp = !parsedBracketChat ? parseWhatsAppLogs(text) : null;
+          const parsedGPT = (!parsedBracketChat && !parsedWhatsApp) ? parseGPTChatLog(text) : null;
           
           if (parsedBracketChat) {
                itemsToAdd.push({
@@ -389,6 +521,14 @@ function processFileContent(fileName: string, text: string): MemoryItem[] {
                   id: idBase,
                   sourceFile: fileName,
                   content: parsedWhatsApp,
+                  timestamp: Date.now(),
+                  type: 'conversation'
+              });
+          } else if (parsedGPT) {
+              itemsToAdd.push({
+                  id: idBase,
+                  sourceFile: fileName,
+                  content: parsedGPT,
                   timestamp: Date.now(),
                   type: 'conversation'
               });
@@ -516,32 +656,39 @@ const analyzeMessages = (messages: any[]): AnalysisStats => {
     };
 };
 
-// --- Vector Logic (Transformers.js) ---
+// --- Worker Hook ---
 
-function cosineSimilarity(a: number[], b: number[]) {
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-    for (let i = 0; i < a.length; i++) {
-        dotProduct += a[i] * b[i];
-        normA += a[i] * a[i];
-        normB += b[i] * b[i];
-    }
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-}
+const useWorker = () => {
+    const workerRef = useRef<Worker | null>(null);
+    const promisesRef = useRef<Map<string, { resolve: (data: any) => void, reject: (err: any) => void }>>(new Map());
 
-let embeddingPipeline: any = null;
+    useEffect(() => {
+        const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+        const worker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+        workerRef.current = worker;
 
-const loadEmbeddingModel = async (onProgress?: (progress: number) => void) => {
-    if (embeddingPipeline) return embeddingPipeline;
-    embeddingPipeline = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
-        progress_callback: (data: any) => {
-            if (data.status === 'progress' && onProgress) {
-                onProgress(data.progress);
+        worker.onmessage = (e) => {
+            const { id, type, payload, error } = e.data;
+            if (id && promisesRef.current.has(id)) {
+                const { resolve, reject } = promisesRef.current.get(id)!;
+                if (error) reject(error);
+                else resolve(payload);
+                promisesRef.current.delete(id);
             }
-        }
-    });
-    return embeddingPipeline;
+        };
+
+        return () => worker.terminate();
+    }, []);
+
+    const sendMessage = (type: string, payload?: any) => {
+        return new Promise((resolve, reject) => {
+            const id = Math.random().toString(36).substring(7);
+            promisesRef.current.set(id, { resolve, reject });
+            workerRef.current?.postMessage({ type, payload, id });
+        });
+    };
+
+    return { sendMessage };
 };
 
 // --- Components ---
@@ -709,14 +856,15 @@ const AnalyticsDashboard = ({ memories, onWordClick }: AnalyticsProps) => {
 // --- Deep Search Component ---
 
 interface DeepSearchProps {
-    vectorStore: VectorItem[];
+    worker: { sendMessage: (type: string, payload?: any) => Promise<any> };
     onInitVectors: () => void;
     isLoadingVectors: boolean;
     initialQuery: string;
     onNavigateToMemory: (memoryId: string, highlightText: string) => void;
+    indexingProgress: number;
 }
 
-const DeepSearch = ({ vectorStore, onInitVectors, isLoadingVectors, initialQuery, onNavigateToMemory }: DeepSearchProps) => {
+const DeepSearch = ({ worker, onInitVectors, isLoadingVectors, initialQuery, onNavigateToMemory, indexingProgress }: DeepSearchProps) => {
     const [query, setQuery] = useState(initialQuery);
     const [results, setResults] = useState<{item: VectorItem, score: number, snippet: string}[]>([]);
     const [isSearching, setIsSearching] = useState(false);
@@ -733,7 +881,7 @@ const DeepSearch = ({ vectorStore, onInitVectors, isLoadingVectors, initialQuery
         const lowerTerm = searchTerm.toLowerCase();
         const index = lowerText.indexOf(lowerTerm);
         
-        if (index === -1) return fullText.substring(0, 150) + "..."; // Fallback to start
+        if (index === -1) return fullText.substring(0, 150) + "..."; 
 
         const start = Math.max(0, index - 50);
         const end = Math.min(fullText.length, index + lowerTerm.length + 100);
@@ -747,43 +895,17 @@ const DeepSearch = ({ vectorStore, onInitVectors, isLoadingVectors, initialQuery
         setResults([]);
 
         try {
-            // 1. Semantic Search
-            let semanticResults: any[] = [];
-            if (vectorStore.length > 0) {
-                const pipe = await loadEmbeddingModel();
-                const output = await pipe(term, { pooling: 'mean', normalize: true });
-                const queryEmbedding = Array.from(output.data) as number[];
-
-                semanticResults = vectorStore.map(vec => ({
-                    item: vec,
-                    score: cosineSimilarity(queryEmbedding, vec.embedding),
-                    snippet: getContextSnippet(vec.text, term) // Try to find term, even in semantic match
-                }))
-                .sort((a, b) => b.score - a.score)
-                .slice(0, 20);
-            }
-
-            // 2. Exact Match Fallback (if vector store empty or for strict matching)
-            // We search within vectors anyway because vectors hold chunks
-            const exactResults = vectorStore
-                .filter(v => v.text.toLowerCase().includes(term.toLowerCase()))
-                .map(v => ({
-                    item: v,
-                    score: 1.0, // Perfect score for exact match
-                    snippet: getContextSnippet(v.text, term)
-                }))
-                .slice(0, 20);
+            // Offload search to worker
+            const workerResults: any[] = await worker.sendMessage('search', { query: term });
             
-            // Merge & Deduplicate
-            const combined = [...exactResults, ...semanticResults];
-            const unique = new Map();
-            combined.forEach(r => {
-                if(!unique.has(r.item.id)) unique.set(r.item.id, r);
-            });
+            // Format results
+            const formatted = workerResults.map(r => ({
+                item: r.item,
+                score: r.score,
+                snippet: getContextSnippet(r.item.text, term)
+            }));
             
-            const finalResults = Array.from(unique.values()).sort((a,b) => b.score - a.score);
-            setResults(finalResults);
-
+            setResults(formatted);
         } catch (e) {
             console.error("Search failed", e);
         } finally {
@@ -839,19 +961,31 @@ const DeepSearch = ({ vectorStore, onInitVectors, isLoadingVectors, initialQuery
                 </div>
 
                 {/* Engine Status */}
-                {vectorStore.length === 0 && (
-                     <div className="flex flex-col items-center gap-4 py-8 border border-dashed border-zinc-800 rounded-xl bg-zinc-900/20">
-                        <p className="text-zinc-500 text-sm">Search Engine is sleeping.</p>
-                        <button 
-                            onClick={onInitVectors}
-                            disabled={isLoadingVectors}
-                            className="flex items-center gap-2 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded-lg transition-colors text-sm"
-                        >
-                            {isLoadingVectors ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4 text-yellow-500" />}
-                            {isLoadingVectors ? "Indexing Memories..." : "Wake up Engine"}
-                        </button>
-                    </div>
-                )}
+                <div className="flex flex-col items-center gap-4">
+                     {isLoadingVectors && (
+                         <div className="w-full max-w-md bg-zinc-900 rounded-full h-1.5 overflow-hidden">
+                             <div className="bg-yellow-500 h-full transition-all duration-300" style={{ width: `${indexingProgress}%` }}></div>
+                         </div>
+                     )}
+                     
+                     <button 
+                         onClick={onInitVectors}
+                         disabled={isLoadingVectors}
+                         className={`flex items-center gap-2 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded-lg transition-colors text-sm ${isLoadingVectors ? 'opacity-50 cursor-not-allowed' : ''}`}
+                     >
+                         {isLoadingVectors ? (
+                            <>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                <span>Indexing... {Math.round(indexingProgress)}%</span>
+                            </>
+                         ) : (
+                            <>
+                                <Zap className="w-4 h-4 text-yellow-500" />
+                                <span>{indexingProgress === 100 ? "Re-sync Index" : "Wake up Engine"}</span>
+                            </>
+                         )}
+                     </button>
+                </div>
 
                 {/* Results List */}
                 <div className="space-y-4 pb-20">
@@ -868,7 +1002,7 @@ const DeepSearch = ({ vectorStore, onInitVectors, isLoadingVectors, initialQuery
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <span className="text-[10px] text-zinc-600">{new Date(res.item.meta.timestamp).toLocaleDateString()}</span>
-                                    {res.score > 0.8 && <span className="text-[10px] bg-emerald-500/10 text-emerald-400 px-1.5 rounded">High Match</span>}
+                                    {res.score > 0.8 && <span className="text-[10px] bg-emerald-500/10 text-emerald-400 px-1.5 rounded">Match: {Math.round(res.score * 100)}%</span>}
                                 </div>
                             </div>
                             
@@ -878,7 +1012,7 @@ const DeepSearch = ({ vectorStore, onInitVectors, isLoadingVectors, initialQuery
                         </div>
                     ))}
                     
-                    {results.length === 0 && query && !isSearching && vectorStore.length > 0 && (
+                    {results.length === 0 && query && !isSearching && (
                         <div className="text-center text-zinc-600 py-10">
                             No matching memories found.
                         </div>
@@ -997,14 +1131,15 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   
+  // Worker & Vector State
+  const { sendMessage } = useWorker();
+  const [isLoadingVectors, setIsLoadingVectors] = useState(false);
+  const [indexingProgress, setIndexingProgress] = useState(0);
+
   // Search Navigation State
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedMemoryId, setExpandedMemoryId] = useState<string | null>(null);
   const [highlightTerm, setHighlightTerm] = useState<string>("");
-
-  // Vector Store State
-  const [vectorStore, setVectorStore] = useState<VectorItem[]>([]);
-  const [isLoadingVectors, setIsLoadingVectors] = useState(false);
 
   // Settings State
   const [userName, setUserName] = useState("User");
@@ -1035,7 +1170,22 @@ function App() {
         } catch(e) {}
     }
     loadData();
+    initWorker();
   }, []);
+
+  const initWorker = async () => {
+      try {
+        await sendMessage('init');
+        // Preload existing vectors into worker
+        const existingVectors = await getAllVectors();
+        if (existingVectors.length > 0) {
+             await sendMessage('load_vectors', existingVectors);
+             setIndexingProgress(100);
+        }
+      } catch (e) {
+          console.error("Worker Init Failed", e);
+      }
+  };
 
   const loadData = async () => {
       try {
@@ -1107,81 +1257,143 @@ function App() {
       try {
           await clearMemories(supabaseConfig.enabled ? supabaseConfig : undefined);
           setMemories([]);
-          setVectorStore([]); 
+          // Also clear worker vectors
+          await sendMessage('load_vectors', []);
+          setIndexingProgress(0);
           addToast('success', 'Cleared', 'All memories deleted.');
       } catch (e) {
           addToast('error', 'Error', (e as Error).message);
       }
   };
 
-  // --- Optimized Vector Initialization (Background Yielding) ---
+  // --- Optimized Background Indexing ---
   const initializeEngine = async () => {
-      if (vectorStore.length > 0) return; 
+      if (isLoadingVectors) return;
       setIsLoadingVectors(true);
+      setIndexingProgress(0);
+
       try {
-          const pipe = await loadEmbeddingModel();
-          const chunks: VectorItem[] = [];
+          // 1. Get existing vectors from DB
+          const existingVectors = await getAllVectors();
+          const existingIds = new Set(existingVectors.map(v => v.id));
+
+          // 2. Identify missing chunks
+          const chunksToEmbed: any[] = [];
           
           memories.forEach(mem => {
               if (mem.type === 'conversation') {
                   const msgs = Array.isArray(mem.content) ? mem.content : mem.content?.messages || [];
-                  for (let i = 0; i < msgs.length; i += 20) {
-                      const batch = msgs.slice(i, i + 20);
-                      const text = batch.map((m: any) => `${m.sender}: ${m.message}`).join('\n');
-                      if (text.length > 50) { 
-                          chunks.push({
-                              id: `${mem.id}_chunk_${i}`,
-                              text: text,
-                              embedding: [],
-                              meta: { 
-                                  source: mem.sourceFile, 
-                                  timestamp: msgs[i]?.date || mem.timestamp,
-                                  sender: batch[0]?.sender,
-                                  originalId: mem.id
-                              }
-                          });
+                  // Larger chunk size for speed (50 messages)
+                  for (let i = 0; i < msgs.length; i += 50) {
+                      const chunkId = `${mem.id}_chunk_${i}`;
+                      if (!existingIds.has(chunkId)) {
+                          const batch = msgs.slice(i, i + 50);
+                          const text = batch.map((m: any) => `${m.sender}: ${m.message}`).join('\n');
+                          if (text.length > 50) { 
+                              chunksToEmbed.push({
+                                  id: chunkId,
+                                  text: text,
+                                  meta: { 
+                                      source: mem.sourceFile, 
+                                      timestamp: msgs[i]?.date || mem.timestamp,
+                                      sender: batch[0]?.sender,
+                                      originalId: mem.id
+                                  }
+                              });
+                          }
                       }
                   }
               } else if (mem.type === 'journal') {
-                  chunks.push({
-                      id: mem.id,
-                      text: mem.content.entry,
-                      embedding: [],
-                      meta: { source: 'Journal', timestamp: mem.timestamp, originalId: mem.id }
-                  });
+                  if (!existingIds.has(mem.id)) {
+                    chunksToEmbed.push({
+                        id: mem.id,
+                        text: mem.content.entry,
+                        meta: { source: 'Journal', timestamp: mem.timestamp, originalId: mem.id }
+                    });
+                  }
               }
           });
 
-          console.log(`Embedding ${chunks.length} chunks...`);
-          addToast('info', 'Neural Core', `Indexing ${chunks.length} chunks in background...`);
-          
-          const vectors: VectorItem[] = [];
-          // Aggressive yielding: Process 1, wait 10ms. 
-          // This ensures the main thread is never blocked for UI interactions.
-          for (let i = 0; i < chunks.length; i++) {
-              const output = await pipe(chunks[i].text, { pooling: 'mean', normalize: true });
-              vectors.push({
-                  ...chunks[i],
-                  embedding: Array.from(output.data) as number[]
-              });
-              // Force yield to main thread to prevent freeze
-              await new Promise(r => setTimeout(r, 10)); 
+          if (chunksToEmbed.length === 0) {
+              addToast('info', 'Engine', 'Index is up to date.');
+              setIndexingProgress(100);
+              setIsLoadingVectors(false);
+              return;
           }
 
-          setVectorStore(vectors);
+          console.log(`Embedding ${chunksToEmbed.length} new chunks...`);
+          
+          // 3. Process in worker
+          for (let i = 0; i < chunksToEmbed.length; i++) {
+              const chunk = chunksToEmbed[i];
+              // Send to worker to embed
+              const result = (await sendMessage('embed_chunk', chunk)) as VectorItem;
+              // Save result to IndexedDB immediately so we don't lose progress
+              await saveVectors([result]);
+              
+              setIndexingProgress(Math.round(((i + 1) / chunksToEmbed.length) * 100));
+          }
+
           setIsLoadingVectors(false);
-          addToast('success', 'Engine Ready', 'Deep Search is active.');
+          addToast('success', 'Engine Ready', `Indexed ${chunksToEmbed.length} new memory blocks.`);
       } catch (e) {
           console.error(e);
           setIsLoadingVectors(false);
-          addToast('error', 'Engine Failed', 'Could not load neural models.');
+          addToast('error', 'Engine Failed', 'Could not complete indexing.');
       }
   };
 
   // --- View Rendering ---
 
+  // Helper for simple markdown formatting (Bold, Italic, Header)
+  const formatText = (text: string) => {
+    if (!text) return "";
+    
+    // Simple split by newline for paragraphs
+    const lines = text.split('\n');
+    
+    return lines.map((line, idx) => {
+        let content = line;
+        
+        // Headers (### )
+        if (content.startsWith('### ')) {
+            return <h3 key={idx} className="text-lg font-semibold text-white mt-4 mb-2">{content.replace('### ', '')}</h3>;
+        }
+        if (content.startsWith('## ')) {
+            return <h2 key={idx} className="text-xl font-bold text-white mt-6 mb-3 border-b border-zinc-800 pb-2">{content.replace('## ', '')}</h2>;
+        }
+
+        // Bold (**text**)
+        const parts = content.split(/(\*\*.*?\*\*)/g);
+        
+        return (
+            <div key={idx} className={`min-h-[1em] ${content.startsWith('-') ? 'ml-4' : ''}`}>
+                {parts.map((part, pIdx) => {
+                    if (part.startsWith('**') && part.endsWith('**')) {
+                        return <strong key={pIdx} className="text-indigo-200 font-semibold">{part.slice(2, -2)}</strong>;
+                    }
+                    // Handle bullet points color
+                    if (part.startsWith('- ')) {
+                       return <span key={pIdx}><span className="text-zinc-500 mr-2">•</span>{part.substring(2)}</span>;
+                    }
+                    return <span key={pIdx}>{part}</span>;
+                })}
+            </div>
+        );
+    });
+  };
+
   const MemoriesView = () => {
       const scrollRef = useRef<HTMLDivElement>(null);
+      const [displayCount, setDisplayCount] = useState(20);
+
+      // Simple infinite scroll trigger
+      const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+          const bottom = e.currentTarget.scrollHeight - e.currentTarget.scrollTop === e.currentTarget.clientHeight;
+          if (bottom) {
+              setDisplayCount(prev => prev + 20);
+          }
+      };
 
       // Auto-scroll to highlight when opening a specific memory
       useEffect(() => {
@@ -1205,40 +1417,65 @@ function App() {
       if (expandedMemoryId) {
           const mem = memories.find(m => m.id === expandedMemoryId);
           if (!mem) return <div>Memory not found</div>;
-
+          
           return (
               <div className="p-4 md:p-8 h-full overflow-y-auto custom-scrollbar bg-zinc-950" ref={scrollRef}>
-                  <div className="max-w-3xl mx-auto">
+                  <div className="max-w-4xl mx-auto pb-20">
                       <button 
                           onClick={() => setExpandedMemoryId(null)}
-                          className="flex items-center gap-2 text-zinc-500 hover:text-white mb-6 transition-colors"
+                          className="flex items-center gap-2 text-zinc-500 hover:text-white mb-6 transition-colors sticky top-0 bg-zinc-950/80 backdrop-blur-sm py-2 z-20 w-full"
                       >
                           <ArrowRight className="w-4 h-4 rotate-180" /> Back to list
                       </button>
                       
-                      <h2 className="text-2xl font-light text-white mb-2">{mem.sourceFile.replace('.json', '')}</h2>
-                      <div className="text-xs text-zinc-600 font-mono mb-8">{new Date(mem.timestamp).toLocaleDateString()}</div>
+                      <div className="mb-8 border-b border-zinc-800 pb-4">
+                        <h2 className="text-3xl font-light text-white mb-1 tracking-tight">{mem.sourceFile.replace('.json', '').replace('.txt', '')}</h2>
+                        <div className="text-sm text-zinc-500 font-mono">{new Date(mem.timestamp).toLocaleDateString()} • {Array.isArray(mem.content) ? mem.content.length + ' messages' : 'Text Entry'}</div>
+                      </div>
 
-                      <div className="space-y-4 font-serif text-lg leading-relaxed text-zinc-300">
+                      <div className="space-y-6">
                           {mem.type === 'conversation' && Array.isArray(mem.content) ? (
-                              mem.content.map((msg: any, i: number) => (
+                              mem.content.map((msg: any, i: number) => {
+                                  const isUser = msg.sender && (
+                                    msg.sender.toLowerCase() === 'user' || 
+                                    USER_ALIASES.has(msg.sender.toLowerCase())
+                                  );
+                                  
+                                  return (
                                   <div 
                                     key={i} 
-                                    className={`p-3 rounded-xl ${msg.sender === 'Unknown' ? 'bg-zinc-900/50' : (USER_ALIASES.has(msg.sender?.toLowerCase()) ? 'bg-indigo-900/20 ml-auto max-w-[80%]' : 'bg-zinc-900 mr-auto max-w-[80%]')}`}
+                                    className={`flex w-full ${isUser ? 'justify-end' : 'justify-start'}`}
                                     data-message-text="true"
                                   >
-                                      <div className="text-xs text-zinc-500 mb-1">{msg.sender}</div>
-                                      <div>
-                                          {msg.message.split(new RegExp(`(${highlightTerm})`, 'gi')).map((part: string, idx: number) => 
-                                              part.toLowerCase() === highlightTerm.toLowerCase() && highlightTerm
-                                              ? <span key={idx} className="bg-yellow-500/40 text-yellow-100 rounded px-1">{part}</span> 
-                                              : part
-                                          )}
+                                      <div className={`max-w-[85%] md:max-w-[75%] rounded-2xl p-5 shadow-sm relative group transition-all
+                                        ${isUser 
+                                            ? 'bg-gradient-to-br from-indigo-900/30 to-indigo-800/20 border border-indigo-500/20 rounded-tr-sm' 
+                                            : 'bg-zinc-900/80 border border-zinc-800 rounded-tl-sm'
+                                        }
+                                      `}>
+                                          <div className={`text-[10px] uppercase tracking-wider font-bold mb-2 flex items-center gap-2 ${isUser ? 'text-indigo-400 justify-end' : 'text-zinc-500'}`}>
+                                              {isUser ? <User className="w-3 h-3" /> : <Bot className="w-3 h-3" />}
+                                              {msg.sender}
+                                          </div>
+                                          
+                                          <div className={`text-base md:text-lg leading-8 ${isUser ? 'text-indigo-50' : 'text-zinc-300'}`}>
+                                              {/* Smart highlighting if search term exists, otherwise format text */}
+                                              {highlightTerm ? (
+                                                  msg.message.split(new RegExp(`(${highlightTerm})`, 'gi')).map((part: string, idx: number) => 
+                                                      part.toLowerCase() === highlightTerm.toLowerCase() && highlightTerm
+                                                      ? <span key={idx} className="bg-yellow-500/40 text-yellow-100 rounded px-1">{part}</span> 
+                                                      : formatText(part)
+                                                  )
+                                              ) : (
+                                                  formatText(msg.message)
+                                              )}
+                                          </div>
                                       </div>
                                   </div>
-                              ))
+                                  );
+                              })
                           ) : (
-                              <div className="whitespace-pre-wrap">
+                              <div className="whitespace-pre-wrap text-zinc-300 font-mono bg-zinc-900 p-6 rounded-xl border border-zinc-800">
                                   {JSON.stringify(mem.content, null, 2)}
                               </div>
                           )}
@@ -1249,8 +1486,11 @@ function App() {
       }
 
       // List View
+      const sortedMemories = useMemo(() => memories.slice().reverse(), [memories]);
+      const visibleMemories = sortedMemories.slice(0, displayCount);
+
       return (
-          <div className="p-4 md:p-8 h-full overflow-y-auto custom-scrollbar">
+          <div className="p-4 md:p-8 h-full overflow-y-auto custom-scrollbar" onScroll={handleScroll}>
             <h2 className="text-2xl font-light mb-6 sticky top-0 bg-zinc-950/80 backdrop-blur-md py-4 z-10 flex items-center justify-between">
                 <span>Memory Stream</span>
                 <span className="text-xs font-mono bg-zinc-900 px-2 py-1 rounded text-zinc-500">{memories.length} items</span>
@@ -1263,7 +1503,7 @@ function App() {
                 </div>
             ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-20">
-                {memories.slice().reverse().map((mem) => (
+                {visibleMemories.map((mem) => (
                     <div 
                         key={mem.id} 
                         onClick={() => setExpandedMemoryId(mem.id)}
@@ -1297,6 +1537,11 @@ function App() {
                 ))}
                 </div>
             )}
+             {displayCount < memories.length && (
+                 <div className="py-4 text-center text-zinc-600 text-xs">
+                     Loading more memories...
+                 </div>
+             )}
           </div>
       );
   };
@@ -1349,10 +1594,11 @@ function App() {
       case 'search':
         return (
             <DeepSearch 
-                vectorStore={vectorStore} 
+                worker={{ sendMessage }} 
                 onInitVectors={initializeEngine} 
                 isLoadingVectors={isLoadingVectors} 
                 initialQuery={searchQuery}
+                indexingProgress={indexingProgress}
                 onNavigateToMemory={(id, highlight) => {
                     setExpandedMemoryId(id);
                     setHighlightTerm(highlight);
