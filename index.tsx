@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createRoot } from "react-dom/client";
-import { GoogleGenAI } from "@google/genai";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 // @ts-ignore
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.16.0/dist/transformers.min.js';
@@ -76,30 +75,18 @@ import {
   Globe,
   MicOff,
   Ear,
-  Type
+  Type,
+  ArrowRight
 } from "lucide-react";
 
 // --- Types & Globals ---
 
-// Fix: Removed conflicting global Window declaration for aistudio.
-// Using type assertion (window as any).aistudio where needed to avoid type conflicts.
-
 interface MemoryItem {
   id: string;
   sourceFile: string;
-  // content can be a Person object, an Emotion object, a Conversation array, a Journal Entry, or a simple Text object
   content: any; 
   timestamp: number;
   type?: 'person' | 'emotion' | 'conversation' | 'text' | 'journal' | 'unknown';
-  embedding?: number[]; // Added for semantic search
-}
-
-interface IntelligenceDossier {
-    subject: string;
-    content: any;
-    sourceFile: string;
-    relevanceScore: number;
-    type: string;
 }
 
 interface SupabaseConfig {
@@ -132,20 +119,16 @@ interface AnalysisStats {
     mediaCount: number;
 }
 
-interface ChatMessage {
-    role: 'user' | 'ai';
-    content: string;
-    timestamp: number;
-    isThinking?: boolean;
-    groundingMetadata?: any;
-    usedContext?: string[]; // Snippets used for the answer
-}
-
 interface VectorItem {
     id: string;
     text: string;
     embedding: number[];
-    meta: any;
+    meta: {
+        source: string;
+        timestamp: number;
+        sender?: string;
+        originalId?: string; // Link back to original memory ID
+    };
 }
 
 // --- Constants ---
@@ -162,74 +145,6 @@ const POSITIVE_WORDS = new Set(['حب', 'احب', 'جميل', 'حلو', 'رائ�
 const NEGATIVE_WORDS = new Set(['كره', 'زعل', 'حزن', 'سيء', 'خرا', 'زفت', 'لا', 'مش', 'رفض', 'غضب', 'تعب', 'ملل', 'قرف', 'hate', 'bad', 'sad', 'angry', 'no', 'not', 'worst', 'boring', 'tired']);
 
 const MOODS = ['😐', '🙂', '😃', '😔', '😠', '😨', '😴', '🥰', '😎', '🧠'];
-
-const QUESTION_CATEGORIES = [
-  {
-    id: 'personality',
-    label: 'Personality Analysis',
-    icon: User,
-    color: 'text-indigo-400',
-    questions: [
-      "What are the top 5 traits in my communication style?",
-      "How has my personality changed over time?",
-      "Who am I most similar to from my past self?",
-      "When was I my most authentic self?",
-      "When was I wearing a social mask?"
-    ]
-  },
-  {
-    id: 'emotions',
-    label: 'Emotional Map',
-    icon: Heart,
-    color: 'text-rose-400',
-    questions: [
-      "What are my most recurring emotions?",
-      "Who triggers my negative emotions?",
-      "When was I writing while stressed vs calm?",
-      "Am I using words to escape specific feelings?",
-      "What did I need to hear but no one said?"
-    ]
-  },
-  {
-    id: 'relationships',
-    label: 'Relationships Dynamics',
-    icon: Users,
-    color: 'text-emerald-400',
-    questions: [
-      "Who influenced my language the most?",
-      "Which relationships seem unbalanced?",
-      "When was I giving more than receiving?",
-      "Is there a pattern to how my relationships end?",
-      "Who brings out the worst version of me?"
-    ]
-  },
-  {
-    id: 'mind',
-    label: 'Mind & Logic',
-    icon: Brain,
-    color: 'text-amber-400',
-    questions: [
-      "What thoughts loop in my head?",
-      "Am I more analytical or emotional?",
-      "When were my decisions driven by fear?",
-      "When did I speak with true confidence?",
-      "What is a question I never asked myself?"
-    ]
-  },
-  {
-    id: 'shadow',
-    label: 'The Shadow (Dark Side)',
-    icon: Ghost, 
-    color: 'text-zinc-500',
-    questions: [
-      "How would a stranger judge me based on this?",
-      "What lie do I keep telling myself?",
-      "What am I ignoring?",
-      "Was I loving or just needy?",
-      "What is the 'Unnoticed Message' I missed?"
-    ]
-  }
-];
 
 // --- IndexedDB Layer ---
 const DB_NAME = "MemoryOS_DB";
@@ -249,7 +164,6 @@ const dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
 
 // --- Storage Abstraction Layer ---
 
-// Helper to get Supabase Client
 const getSupabase = (config: SupabaseConfig): SupabaseClient | null => {
     if (!config.enabled || !config.url || !config.key) return null;
     try {
@@ -264,8 +178,6 @@ async function saveMemories(items: MemoryItem[], config?: SupabaseConfig) {
   const sb = config ? getSupabase(config) : null;
 
   if (sb) {
-      // Cloud Mode
-      // Map to snake_case for DB
       const rows = items.map(item => ({
           id: item.id,
           source_file: item.sourceFile,
@@ -273,17 +185,14 @@ async function saveMemories(items: MemoryItem[], config?: SupabaseConfig) {
           timestamp: item.timestamp,
           type: item.type || 'unknown'
       }));
-      
       const { error } = await sb.from('memories').upsert(rows);
       if (error) {
-          // Enhance error message for common Supabase issues
           if (error.message.includes('fetch')) throw new Error("Network Error: Could not connect to Supabase.");
           if (error.code === '42501' || error.message.includes('JWT')) throw new Error("Permission Denied: Check API Key or Table Policies.");
           throw new Error("Cloud Sync Failed: " + error.message);
       }
       return;
   } else {
-      // Local Mode
       try {
         const db = await dbPromise;
         const tx = db.transaction(STORE_NAME, "readwrite");
@@ -303,14 +212,12 @@ async function getAllMemories(config?: SupabaseConfig): Promise<MemoryItem[]> {
   const sb = config ? getSupabase(config) : null;
 
   if (sb) {
-      // Cloud Mode
       const { data, error } = await sb.from('memories').select('*');
       if (error) {
            if (error.message.includes('fetch')) throw new Error("Network Error: Could not reach cloud database.");
            if (error.code === 'PGRST116') throw new Error("Data Format Error: Unexpected response structure.");
            throw new Error("Fetch Failed: " + error.message);
       }
-      // Map back to MemoryItem
       return (data || []).map((row: any) => ({
           id: row.id,
           sourceFile: row.source_file,
@@ -319,7 +226,6 @@ async function getAllMemories(config?: SupabaseConfig): Promise<MemoryItem[]> {
           type: row.type
       }));
   } else {
-      // Local Mode
       try {
           const db = await dbPromise;
           const tx = db.transaction(STORE_NAME, "readonly");
@@ -337,13 +243,10 @@ async function getAllMemories(config?: SupabaseConfig): Promise<MemoryItem[]> {
 
 async function clearMemories(config?: SupabaseConfig) {
     const sb = config ? getSupabase(config) : null;
-
     if (sb) {
-        // Cloud Mode - Delete all
-        const { error } = await sb.from('memories').delete().neq('id', '0'); // Hack to delete all
+        const { error } = await sb.from('memories').delete().neq('id', '0'); 
         if (error) throw new Error("Cloud Wipe Failed: " + error.message);
     } else {
-        // Local Mode
         const db = await dbPromise;
         const tx = db.transaction(STORE_NAME, "readwrite");
         const store = tx.objectStore(STORE_NAME);
@@ -358,9 +261,7 @@ async function clearMemories(config?: SupabaseConfig) {
 // --- Parsing Logic ---
 
 function parseWhatsAppLogs(text: string): any[] | null {
-    // Regex for: "14/08/24, 5:56 pm - Sender Name: Message Content"
     const regex = /^(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}),\s*(\d{1,2}:\d{2}\s?(?:[aApP][mM])?)\s*-\s*([^:]+):\s*(.+)/;
-    
     const lines = text.split('\n');
     const messages: any[] = [];
     let currentMessage: any = null;
@@ -389,10 +290,7 @@ function parseWhatsAppLogs(text: string): any[] | null {
 }
 
 function parseBracketLogs(text: string): any[] | null {
-    // Regex for: [Date] - [Sender]: [Message]
-    // Handles cases like: [التاريخ والوقت غير متوفر] - [user]: [Message content...]
     const regex = /^\[(.*?)\]\s*-\s*\[(.*?)\]:\s*(.*)/;
-    
     const lines = text.split('\n');
     const messages: any[] = [];
     let currentMessage: any = null;
@@ -403,13 +301,10 @@ function parseBracketLogs(text: string): any[] | null {
         if (match) {
             matchCount++;
             if (currentMessage) messages.push(currentMessage);
-            
             let content = match[3].trim();
-            // Remove starting bracket if present (common in this format)
             if (content.startsWith('[')) {
                 content = content.substring(1);
             }
-
             currentMessage = {
                 date: match[1].trim(),
                 sender: match[2].trim(),
@@ -422,10 +317,7 @@ function parseBracketLogs(text: string): any[] | null {
             }
         }
     }
-    
     if (currentMessage) messages.push(currentMessage);
-
-    // Post-processing: Remove trailing ']' if the format wrapped the message in brackets
     if (matchCount > 0) {
         messages.forEach(msg => {
             const trimmed = msg.message.trim();
@@ -438,12 +330,10 @@ function parseBracketLogs(text: string): any[] | null {
     return null;
 }
 
-// Process text content into MemoryItems
 function processFileContent(fileName: string, text: string): MemoryItem[] {
       const itemsToAdd: MemoryItem[] = [];
       const idBase = `${fileName}_${Date.now()}`;
 
-      // STRICT JSON CHECKING
       if (fileName.endsWith('.json')) {
           try {
               const json = JSON.parse(text);
@@ -478,14 +368,11 @@ function processFileContent(fileName: string, text: string): MemoryItem[] {
               }
               return itemsToAdd;
           } catch (e) {
-              // Ensure we don't treat broken JSON as text silently
               throw new Error(`Invalid JSON in ${fileName}: ${(e as Error).message}`);
           }
       } 
       
-      // TEXT / CHAT LOGS
       try {
-          // Try different parsers
           const parsedBracketChat = parseBracketLogs(text);
           const parsedWhatsApp = !parsedBracketChat ? parseWhatsAppLogs(text) : null;
           
@@ -506,7 +393,6 @@ function processFileContent(fileName: string, text: string): MemoryItem[] {
                   type: 'conversation'
               });
           } else {
-              // Fallback to plain text only if explicitly text or unknown extension
               itemsToAdd.push({
                   id: idBase,
                   sourceFile: fileName,
@@ -540,23 +426,18 @@ const analyzeMessages = (messages: any[]): AnalysisStats => {
     const wordFreq: Record<string, number> = {};
     const emojiFreq: Record<string, number> = {};
     const activityByHour = new Array(24).fill(0);
-    const activityByDay = new Array(7).fill(0); // 0 = Sunday
+    const activityByDay = new Array(7).fill(0); 
     let positive = 0;
     let negative = 0;
     let neutral = 0;
-
-    // Emoji Regex
     const emojiRegex = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu;
 
     messages.forEach(msg => {
         const text = msg.message || msg.text || '';
         const sender = msg.sender || 'Unknown';
-        
-        // Sender stats
         senderCounts[sender] = (senderCounts[sender] || 0) + 1;
 
-        // Basic Text Stats
-        if (text.includes('<Media omitted>') || text.includes('image omitted') || text.includes('video omitted')) {
+        if (text.includes('<Media omitted>') || text.includes('image omitted')) {
             mediaCount++;
             return;
         }
@@ -567,7 +448,6 @@ const analyzeMessages = (messages: any[]): AnalysisStats => {
             longest = { text: text.substring(0, 100) + (len > 100 ? '...' : ''), sender, length: len };
         }
 
-        // Tokenization
         const words = text.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()?"']/g, "").split(/\s+/);
         words.forEach((w: string) => {
             if (w && !STOPWORDS.has(w) && !Number(w)) {
@@ -579,7 +459,6 @@ const analyzeMessages = (messages: any[]): AnalysisStats => {
             else neutral++;
         });
 
-        // Emojis
         const emojis = text.match(emojiRegex);
         if (emojis) {
             emojis.forEach((e: string) => {
@@ -587,36 +466,26 @@ const analyzeMessages = (messages: any[]): AnalysisStats => {
             });
         }
 
-        // Time Analysis
-        // Try to parse date/time. Formats vary wildly.
-        // Assuming "14/08/24, 5:56 pm" or standard ISO
         try {
             let dateObj;
             if (msg.date && msg.time) {
-                 // Hacky parser for DD/MM/YY
                  const [day, month, year] = msg.date.split(/[\/.-]/).map(Number);
                  let timeStr = msg.time.toLowerCase();
                  let [hours, minutes] = timeStr.replace(/[ap]m/, '').split(':').map(Number);
                  if (timeStr.includes('pm') && hours < 12) hours += 12;
                  if (timeStr.includes('am') && hours === 12) hours = 0;
-                 
-                 // Reconstruct roughly
                  const fullYear = year < 100 ? 2000 + year : year;
                  dateObj = new Date(fullYear, month - 1, day, hours, minutes);
             } else if (msg.timestamp) {
                 dateObj = new Date(msg.timestamp);
             }
-
             if (dateObj && !isNaN(dateObj.getTime())) {
                 activityByHour[dateObj.getHours()]++;
                 activityByDay[dateObj.getDay()]++;
             }
-        } catch (e) {
-            // Ignore time parse errors
-        }
+        } catch (e) {}
     });
 
-    // Sorting and Formatting
     const topSenders = Object.entries(senderCounts)
         .sort((a, b) => b[1] - a[1])
         .map(([name, count]) => ({ name, count }));
@@ -649,7 +518,6 @@ const analyzeMessages = (messages: any[]): AnalysisStats => {
 
 // --- Vector Logic (Transformers.js) ---
 
-// Cosine Similarity
 function cosineSimilarity(a: number[], b: number[]) {
     let dotProduct = 0;
     let normA = 0;
@@ -662,13 +530,10 @@ function cosineSimilarity(a: number[], b: number[]) {
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-// Global pipeline singleton to avoid reloading
 let embeddingPipeline: any = null;
 
 const loadEmbeddingModel = async (onProgress?: (progress: number) => void) => {
     if (embeddingPipeline) return embeddingPipeline;
-    
-    console.log("Loading Xenova/all-MiniLM-L6-v2...");
     embeddingPipeline = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
         progress_callback: (data: any) => {
             if (data.status === 'progress' && onProgress) {
@@ -679,7 +544,7 @@ const loadEmbeddingModel = async (onProgress?: (progress: number) => void) => {
     return embeddingPipeline;
 };
 
-// --- Analytics Components ---
+// --- Components ---
 
 const SimpleBarChart = ({ data, labels, color = "bg-indigo-500", height = 100 }: { data: number[], labels: string[], color?: string, height?: number }) => {
     const max = Math.max(...data, 1);
@@ -691,7 +556,6 @@ const SimpleBarChart = ({ data, labels, color = "bg-indigo-500", height = 100 }:
                         className={`w-full rounded-t-sm opacity-80 group-hover:opacity-100 transition-all ${color}`} 
                         style={{ height: `${(val / max) * 100}%` }}
                     ></div>
-                    {/* Tooltip */}
                     <div className="absolute bottom-full mb-1 hidden group-hover:block bg-black text-white text-[10px] px-2 py-1 rounded whitespace-nowrap z-10 border border-zinc-800">
                         {labels[i]}: {val}
                     </div>
@@ -701,117 +565,37 @@ const SimpleBarChart = ({ data, labels, color = "bg-indigo-500", height = 100 }:
     );
 };
 
-const KeywordBubble = ({ word, count, max }: { word: string, count: number, max: number }) => {
+const KeywordBubble = ({ word, count, max, onClick }: { word: string, count: number, max: number, onClick: (word: string) => void }) => {
     const size = Math.max(0.8, Math.min(2.5, 0.8 + (count / max) * 2));
     const opacity = Math.max(0.4, Math.min(1, 0.4 + (count / max)));
     
     return (
-        <span 
-            className="inline-block m-1 px-2 py-1 rounded-lg bg-zinc-800/50 hover:bg-indigo-900/50 hover:text-white transition-colors cursor-default"
+        <button 
+            onClick={() => onClick(word)}
+            className="inline-block m-1 px-2 py-1 rounded-lg bg-zinc-800/50 hover:bg-indigo-900/50 hover:text-white transition-colors cursor-pointer border border-transparent hover:border-indigo-500/30"
             style={{ fontSize: `${size}rem`, opacity }}
         >
             {word}
             <span className="ml-1 text-[0.6em] opacity-50">{count}</span>
-        </span>
+        </button>
     );
 };
 
 interface AnalyticsProps {
     memories: MemoryItem[];
-    vectorStore: VectorItem[];
-    onInitVectors: () => void;
-    isLoadingVectors: boolean;
+    onWordClick: (word: string) => void;
 }
 
-const AnalyticsDashboard = ({ memories, vectorStore, onInitVectors, isLoadingVectors }: AnalyticsProps) => {
+const AnalyticsDashboard = ({ memories, onWordClick }: AnalyticsProps) => {
     const [selectedId, setSelectedId] = useState<string>("all");
-    const [semanticQuery, setSemanticQuery] = useState("");
-    const [searchMode, setSearchMode] = useState<'semantic' | 'exact'>('exact'); // Default to Exact for speed
-    const [searchResults, setSearchResults] = useState<any[]>([]);
-    const [isSearching, setIsSearching] = useState(false);
     
-    // Filter only conversations
     const conversations = useMemo(() => {
         return memories.filter(m => m.type === 'conversation' || (Array.isArray(m.content) && m.content[0]?.sender));
     }, [memories]);
 
-    // Mode: Exact Search (String Matching)
-    const performExactSearch = () => {
-        if (!semanticQuery.trim()) return;
-        setIsSearching(true);
-        const term = semanticQuery.toLowerCase();
-        const results: any[] = [];
-
-        conversations.forEach(c => {
-            const msgs = Array.isArray(c.content) ? c.content : c.content?.messages || [];
-            msgs.forEach((m: any) => {
-                const text = m.message || m.text || '';
-                const sender = m.sender || 'Unknown';
-                // Check if text or sender contains the term
-                if (text.toLowerCase().includes(term) || sender.toLowerCase().includes(term)) {
-                    results.push({
-                        message: text,
-                        sender: sender,
-                        timestamp: m.date || c.timestamp // Try to get specific message date or fallback to file date
-                    });
-                }
-            });
-        });
-
-        // Limit results to avoid UI lag on broad queries
-        setSearchResults(results.slice(0, 100));
-        setIsSearching(false);
-    };
-
-    // Mode: Semantic Search (Vectors)
-    const performSemanticSearch = async () => {
-        if (!semanticQuery.trim() || vectorStore.length === 0) return;
-        setIsSearching(true);
-        try {
-            const pipe = await loadEmbeddingModel();
-            const output = await pipe(semanticQuery, { pooling: 'mean', normalize: true });
-            const queryEmbedding = Array.from(output.data) as number[];
-
-            // Score and filter
-            const scored = vectorStore.map(vec => ({
-                ...vec,
-                score: cosineSimilarity(queryEmbedding, vec.embedding)
-            }));
-            
-            // Get top 50 chunks
-            const topK = scored.sort((a, b) => b.score - a.score).slice(0, 50);
-            
-            const relevantMessages = topK.map(k => ({
-                message: k.text,
-                sender: k.meta.sender || 'Unknown', 
-                timestamp: k.meta.timestamp
-            }));
-            
-            setSearchResults(relevantMessages);
-        } catch (e) {
-            console.error("Semantic search failed", e);
-        } finally {
-            setIsSearching(false);
-        }
-    };
-
-    const handleSearch = () => {
-        setSearchResults([]);
-        if (searchMode === 'semantic') {
-            performSemanticSearch();
-        } else {
-            performExactSearch();
-        }
-    };
-
-    // Compute Stats (Based on search results OR selected conversation)
     const stats = useMemo(() => {
         let msgsToAnalyze: any[] = [];
-        
-        if (searchResults.length > 0) {
-            // If search yielded results, analyze them
-            msgsToAnalyze = searchResults;
-        } else if (selectedId === "all") {
+        if (selectedId === "all") {
             conversations.forEach(c => {
                 const content = Array.isArray(c.content) ? c.content : c.content?.messages || [];
                 msgsToAnalyze = [...msgsToAnalyze, ...content];
@@ -823,119 +607,32 @@ const AnalyticsDashboard = ({ memories, vectorStore, onInitVectors, isLoadingVec
             }
         }
         return analyzeMessages(msgsToAnalyze);
-    }, [conversations, selectedId, searchResults]);
+    }, [conversations, selectedId]);
 
     const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     const hours = Array.from({length: 24}, (_, i) => i.toString());
 
     return (
         <div className="p-4 space-y-6 pb-24 overflow-y-auto h-full custom-scrollbar">
-             {/* Header */}
-             <div className="flex flex-col gap-4">
-                <div className="flex items-center justify-between">
-                    <h2 className="text-xl font-semibold flex items-center gap-2">
-                        <BarChart2 className="w-5 h-5 text-indigo-400" />
-                        Deep Analytics
-                    </h2>
-                    
-                    {searchResults.length === 0 && (
-                        <select 
-                            value={selectedId}
-                            onChange={(e) => setSelectedId(e.target.value)}
-                            className="bg-zinc-800 border-none text-xs rounded-md px-2 py-1 outline-none focus:ring-1 focus:ring-indigo-500 max-w-[150px]"
-                        >
-                            <option value="all">All Conversations</option>
-                            {conversations.map(c => (
-                                <option key={c.id} value={c.id}>
-                                    {c.sourceFile.replace('.json', '').replace('whatsapp_', '')}
-                                </option>
-                            ))}
-                        </select>
-                    )}
-                </div>
-
-                {/* Filter / Search Bar */}
-                <div className="bg-zinc-900/50 p-2 rounded-xl border border-zinc-800 flex flex-col gap-2">
-                    
-                    {/* Search Mode Toggles */}
-                    <div className="flex gap-2">
-                        <button 
-                            onClick={() => setSearchMode('exact')}
-                            className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-medium transition-all ${
-                                searchMode === 'exact' 
-                                ? 'bg-zinc-800 text-white shadow-sm' 
-                                : 'text-zinc-500 hover:bg-zinc-800/50'
-                            }`}
-                        >
-                            <Type className="w-3.5 h-3.5" /> Classic Search
-                        </button>
-                        
-                        {vectorStore.length > 0 ? (
-                            <button 
-                                onClick={() => setSearchMode('semantic')}
-                                className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-medium transition-all ${
-                                    searchMode === 'semantic' 
-                                    ? 'bg-indigo-600/20 text-indigo-400 shadow-sm border border-indigo-500/30' 
-                                    : 'text-zinc-500 hover:bg-zinc-800/50'
-                                }`}
-                            >
-                                <Zap className="w-3.5 h-3.5" /> AI Search
-                            </button>
-                        ) : (
-                            <button 
-                                onClick={onInitVectors}
-                                disabled={isLoadingVectors}
-                                className="flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-medium bg-zinc-800/30 text-zinc-600 hover:bg-zinc-800 hover:text-zinc-400 transition-colors"
-                            >
-                                {isLoadingVectors ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
-                                Enable AI Search
-                            </button>
-                        )}
-                    </div>
-
-                    <div className="flex gap-2">
-                        <div className="flex-1 relative">
-                           <Search className="absolute left-3 top-2.5 w-4 h-4 text-zinc-500" />
-                           <input 
-                               type="text"
-                               value={semanticQuery}
-                               onChange={(e) => setSemanticQuery(e.target.value)}
-                               onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-                               placeholder={searchMode === 'semantic' ? "Search by meaning (e.g., 'feeling sad')..." : "Search exact words (e.g., 'Cairo', '2023')..."}
-                               className="w-full bg-zinc-950 rounded-lg pl-9 pr-8 py-2 text-sm focus:ring-1 focus:ring-indigo-500 outline-none placeholder-zinc-600"
-                           />
-                           {searchResults.length > 0 && (
-                               <button 
-                                   onClick={() => { setSearchResults([]); setSemanticQuery(""); }}
-                                   className="absolute right-2 top-2 text-zinc-500 hover:text-zinc-300"
-                               >
-                                   <X className="w-4 h-4" />
-                               </button>
-                           )}
-                        </div>
-                        <button 
-                            onClick={handleSearch}
-                            disabled={isSearching}
-                            className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 rounded-lg transition-colors"
-                        >
-                            {isSearching ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-                        </button>
-                    </div>
-                </div>
-
-                {searchResults.length > 0 && (
-                    <div className={`border px-3 py-2 rounded-lg text-xs flex items-center gap-2 ${
-                        searchMode === 'semantic' 
-                        ? 'bg-indigo-500/10 border-indigo-500/20 text-indigo-300' 
-                        : 'bg-zinc-800 border-zinc-700 text-zinc-300'
-                    }`}>
-                        {searchMode === 'semantic' ? <Sparkles className="w-3 h-3" /> : <Search className="w-3 h-3" />}
-                        Found {searchResults.length} matches for "{semanticQuery}"
-                    </div>
-                )}
+             <div className="flex items-center justify-between">
+                <h2 className="text-xl font-semibold flex items-center gap-2">
+                    <BarChart2 className="w-5 h-5 text-indigo-400" />
+                    Deep Analytics
+                </h2>
+                <select 
+                    value={selectedId}
+                    onChange={(e) => setSelectedId(e.target.value)}
+                    className="bg-zinc-800 border-none text-xs rounded-md px-2 py-1 outline-none focus:ring-1 focus:ring-indigo-500 max-w-[150px]"
+                >
+                    <option value="all">All Conversations</option>
+                    {conversations.map(c => (
+                        <option key={c.id} value={c.id}>
+                            {c.sourceFile.replace('.json', '').replace('whatsapp_', '')}
+                        </option>
+                    ))}
+                </select>
             </div>
 
-            {/* Overview Cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                 <div className="bg-zinc-900/50 p-3 rounded-lg border border-zinc-800/50">
                     <div className="text-zinc-400 text-xs mb-1">Total Messages</div>
@@ -958,7 +655,6 @@ const AnalyticsDashboard = ({ memories, vectorStore, onInitVectors, isLoadingVec
                 </div>
             </div>
 
-            {/* Activity Charts */}
             <div className="grid md:grid-cols-2 gap-4">
                 <div className="bg-zinc-900/30 p-4 rounded-xl border border-zinc-800/50">
                     <h3 className="text-sm font-medium text-zinc-300 mb-4 flex items-center gap-2">
@@ -974,19 +670,18 @@ const AnalyticsDashboard = ({ memories, vectorStore, onInitVectors, isLoadingVec
                 </div>
             </div>
 
-            {/* Word Cloud */}
             <div className="bg-zinc-900/30 p-4 rounded-xl border border-zinc-800/50">
                  <h3 className="text-sm font-medium text-zinc-300 mb-4 flex items-center gap-2">
                         <Hash className="w-4 h-4" /> Top Keywords
+                        <span className="text-[10px] text-zinc-500 ml-2 font-normal">(Click word to see context)</span>
                 </h3>
                 <div className="flex flex-wrap justify-center">
                     {stats.topWords.map((w, i) => (
-                        <KeywordBubble key={i} word={w.word} count={w.count} max={stats.topWords[0]?.count || 1} />
+                        <KeywordBubble key={i} word={w.word} count={w.count} max={stats.topWords[0]?.count || 1} onClick={onWordClick} />
                     ))}
                 </div>
             </div>
 
-             {/* Top Senders */}
              <div className="bg-zinc-900/30 p-4 rounded-xl border border-zinc-800/50">
                  <h3 className="text-sm font-medium text-zinc-300 mb-4 flex items-center gap-2">
                         <Users className="w-4 h-4" /> Top Speakers
@@ -1007,351 +702,192 @@ const AnalyticsDashboard = ({ memories, vectorStore, onInitVectors, isLoadingVec
                     ))}
                 </div>
             </div>
-
-            {searchResults.length > 0 && (
-                <div className="bg-zinc-900/30 p-4 rounded-xl border border-zinc-800/50">
-                    <h3 className="text-sm font-medium text-zinc-300 mb-4 flex items-center gap-2">
-                        <MessageSquare className="w-4 h-4" /> Matches Found
-                    </h3>
-                    <div className="space-y-3">
-                        {searchResults.slice(0, 10).map((m, i) => (
-                            <div key={i} className="bg-zinc-950 p-3 rounded-lg text-sm border border-zinc-800">
-                                <div className="text-xs text-indigo-400 mb-1 font-semibold">{m.sender}</div>
-                                <div className="text-zinc-300 leading-relaxed">
-                                    {/* Highlighting simple matches manually for exact search */}
-                                    {searchMode === 'exact' ? (
-                                        <span>
-                                            {m.message.split(new RegExp(`(${semanticQuery})`, 'gi')).map((part: string, i: number) => 
-                                                part.toLowerCase() === semanticQuery.toLowerCase() 
-                                                ? <span key={i} className="bg-yellow-500/20 text-yellow-200 px-0.5 rounded">{part}</span> 
-                                                : part
-                                            )}
-                                        </span>
-                                    ) : (
-                                        m.message
-                                    )}
-                                </div>
-                            </div>
-                        ))}
-                        {searchResults.length > 10 && (
-                            <div className="text-center text-xs text-zinc-500 pt-2">
-                                +{searchResults.length - 10} more matches...
-                            </div>
-                        )}
-                    </div>
-                </div>
-            )}
         </div>
     );
 };
 
-interface NeuralAnalystProps {
-    memories: MemoryItem[];
+// --- Deep Search Component ---
+
+interface DeepSearchProps {
     vectorStore: VectorItem[];
     onInitVectors: () => void;
     isLoadingVectors: boolean;
+    initialQuery: string;
+    onNavigateToMemory: (memoryId: string, highlightText: string) => void;
 }
 
-const NeuralAnalyst = ({ memories, vectorStore, onInitVectors, isLoadingVectors }: NeuralAnalystProps) => {
-    const [mode, setMode] = useState<'analyst' | 'mirror' | 'silence'>('analyst');
-    const [messages, setMessages] = useState<ChatMessage[]>([]);
-    const [input, setInput] = useState("");
-    const [isThinking, setIsThinking] = useState(false);
-    const chatEndRef = useRef<HTMLDivElement>(null);
-
-    // Initial Message
-    useEffect(() => {
-        if (messages.length === 0) {
-            setMessages([{
-                role: 'ai',
-                content: "I am your Neural Analyst. I don't just chat; I analyze patterns, timelines, and hidden meanings in your data. \n\nTry asking: \n\"Make a timeline of my relationship with...\" \n\"When did my tone change?\"",
-                timestamp: Date.now()
-            }]);
-        }
-    }, []);
+const DeepSearch = ({ vectorStore, onInitVectors, isLoadingVectors, initialQuery, onNavigateToMemory }: DeepSearchProps) => {
+    const [query, setQuery] = useState(initialQuery);
+    const [results, setResults] = useState<{item: VectorItem, score: number, snippet: string}[]>([]);
+    const [isSearching, setIsSearching] = useState(false);
 
     useEffect(() => {
-        chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [messages]);
-
-    // Semantic Search Helper
-    const searchMemory = async (query: string, topK = 15) => {
-        if (vectorStore.length === 0) return [];
-        
-        const pipe = await loadEmbeddingModel();
-        const output = await pipe(query, { pooling: 'mean', normalize: true });
-        const queryEmbedding = Array.from(output.data) as number[];
-
-        const scored = vectorStore.map(vec => ({
-            ...vec,
-            score: cosineSimilarity(queryEmbedding, vec.embedding)
-        }));
-
-        scored.sort((a, b) => b.score - a.score);
-        return scored.slice(0, topK);
-    };
-
-    // Mirror Mode
-    const runMirrorAnalysis = async () => {
-        setIsThinking(true);
-        // Compare first 10% vs last 10% of vectors
-        if(vectorStore.length < 10) {
-             setMessages(prev => [...prev, { role: 'ai', content: "Not enough data for Mirror Mode. Import more conversations.", timestamp: Date.now() }]);
-             setIsThinking(false);
-             return;
+        if (initialQuery) {
+            setQuery(initialQuery);
+            performSearch(initialQuery);
         }
+    }, [initialQuery]);
 
-        const past = vectorStore.slice(0, 5).map(v => v.text).join('\n---\n');
-        const present = vectorStore.slice(-5).map(v => v.text).join('\n---\n');
-
-        const prompt = `
-        Compare the User's "Past Self" vs "Present Self".
+    const getContextSnippet = (fullText: string, searchTerm: string) => {
+        const lowerText = fullText.toLowerCase();
+        const lowerTerm = searchTerm.toLowerCase();
+        const index = lowerText.indexOf(lowerTerm);
         
-        PAST SAMPLES:
-        ${past}
+        if (index === -1) return fullText.substring(0, 150) + "..."; // Fallback to start
 
-        PRESENT SAMPLES:
-        ${present}
-
-        Output a psychological profile comparing: Tone, Vocabulary, and Emotional State.
-        `;
-
-        await generateAIResponse(prompt, "Mirror Analysis");
+        const start = Math.max(0, index - 50);
+        const end = Math.min(fullText.length, index + lowerTerm.length + 100);
+        
+        return (start > 0 ? "..." : "") + fullText.substring(start, end) + (end < fullText.length ? "..." : "");
     };
 
-    // Silence Analysis
-    const runSilenceAnalysis = async () => {
-        setIsThinking(true);
-        // Find a random gap > 3 days
-        // This is a simulation since we don't have full date parsing in vectors yet
-        // In real app, we'd use the timestamp meta from vectors
-        const prompt = `
-        Analyze the concept of "Silence" in the user's data. 
-        Look for patterns where the user stops replying or writes shorter messages.
-        
-        CONTEXT SAMPLES:
-        ${vectorStore.slice(0, 10).map(v => v.text).join('\n')}
-        `;
-        
-        await generateAIResponse(prompt, "Silence Analysis");
-    };
-
-    // Core Generation
-    const generateAIResponse = async (promptContext: string, systemRole: string) => {
-        setIsThinking(true);
-        try {
-            const apiKey = process.env.API_KEY;
-            if (!apiKey) throw new Error("API Key missing");
-            const ai = new GoogleGenAI({ apiKey });
-            
-            const response = await ai.models.generateContent({
-                model: 'gemini-3-flash-preview',
-                contents: [
-                    { role: 'user', parts: [{ text: `
-                        SYSTEM ROLE: ${systemRole}.
-                        IDENTITY: The user is identified by names like "Mohammed", "Mohamed", "Me", "User", "Ana". Treat these as the "Self".
-                        
-                        INSTRUCTION: Answer based ONLY on the provided context. Do not invent facts.
-                        
-                        ${promptContext}
-                    ` }] }
-                ],
-                config: {
-                    thinkingConfig: { thinkingBudget: 1024 }
-                }
-            });
-
-            setMessages(prev => [...prev, {
-                role: 'ai',
-                content: response.text || "No insight found.",
-                timestamp: Date.now()
-            }]);
-        } catch (e) {
-            setMessages(prev => [...prev, {
-                role: 'ai',
-                content: "Error: Could not connect to Neural Core (Check API Key).",
-                timestamp: Date.now()
-            }]);
-        } finally {
-            setIsThinking(false);
-        }
-    };
-
-    const handleSendMessage = async () => {
-        if (!input.trim()) return;
-        
-        const userMsg = input;
-        setMessages(prev => [...prev, { role: 'user', content: userMsg, timestamp: Date.now() }]);
-        setInput("");
-        setIsThinking(true);
+    const performSearch = async (term: string) => {
+        if (!term.trim()) return;
+        setIsSearching(true);
+        setResults([]);
 
         try {
-            if (vectorStore.length === 0) {
-                 setMessages(prev => [...prev, { role: 'ai', content: "Please initialize the Neural Engine first (click the button in toolbar).", timestamp: Date.now() }]);
-                 setIsThinking(false);
-                 return;
+            // 1. Semantic Search
+            let semanticResults: any[] = [];
+            if (vectorStore.length > 0) {
+                const pipe = await loadEmbeddingModel();
+                const output = await pipe(term, { pooling: 'mean', normalize: true });
+                const queryEmbedding = Array.from(output.data) as number[];
+
+                semanticResults = vectorStore.map(vec => ({
+                    item: vec,
+                    score: cosineSimilarity(queryEmbedding, vec.embedding),
+                    snippet: getContextSnippet(vec.text, term) // Try to find term, even in semantic match
+                }))
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 20);
             }
 
-            // 1. Retrieve Context
-            const context = await searchMemory(userMsg, 20); // Top 20 chunks
-            const contextText = context.map(c => `[Source: ${c.meta.source}] ${c.text}`).join('\n\n');
-
-            // 2. Generate
-            const prompt = `
-            CONTEXT FROM MEMORY:
-            ${contextText}
+            // 2. Exact Match Fallback (if vector store empty or for strict matching)
+            // We search within vectors anyway because vectors hold chunks
+            const exactResults = vectorStore
+                .filter(v => v.text.toLowerCase().includes(term.toLowerCase()))
+                .map(v => ({
+                    item: v,
+                    score: 1.0, // Perfect score for exact match
+                    snippet: getContextSnippet(v.text, term)
+                }))
+                .slice(0, 20);
             
-            USER REQUEST:
-            "${userMsg}"
+            // Merge & Deduplicate
+            const combined = [...exactResults, ...semanticResults];
+            const unique = new Map();
+            combined.forEach(r => {
+                if(!unique.has(r.item.id)) unique.set(r.item.id, r);
+            });
             
-            Perform a deep analysis. If the user asks for a timeline, summarize chronological events. If they ask about feelings, trace emotional words.
-            `;
-
-            await generateAIResponse(prompt, "Psychological Analyst");
+            const finalResults = Array.from(unique.values()).sort((a,b) => b.score - a.score);
+            setResults(finalResults);
 
         } catch (e) {
-            console.error(e);
-            setMessages(prev => [...prev, { role: 'ai', content: "Analysis failed.", timestamp: Date.now() }]);
+            console.error("Search failed", e);
         } finally {
-            setIsThinking(false);
+            setIsSearching(false);
         }
+    };
+
+    const highlightText = (text: string, highlight: string) => {
+        if (!highlight.trim()) return text;
+        const parts = text.split(new RegExp(`(${highlight})`, 'gi'));
+        return (
+            <span>
+                {parts.map((part, i) => 
+                    part.toLowerCase() === highlight.toLowerCase() 
+                        ? <span key={i} className="bg-yellow-500/30 text-yellow-200 rounded px-0.5">{part}</span> 
+                        : part
+                )}
+            </span>
+        );
     };
 
     return (
-        <div className="flex flex-col h-full bg-zinc-950 text-zinc-100">
-            {/* Toolbar */}
-            <div className="flex items-center justify-between p-4 border-b border-zinc-900 bg-zinc-950/50 backdrop-blur sticky top-0 z-10">
-                <div className="flex items-center gap-4">
+        <div className="flex flex-col h-full bg-zinc-950 p-4 md:p-8 animate-fade-in">
+             <div className="max-w-3xl mx-auto w-full space-y-8">
+                {/* Search Header */}
+                <div className="text-center space-y-4">
+                    <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-zinc-900 border border-zinc-800 shadow-xl mb-2">
+                        <Search className="w-6 h-6 text-indigo-500" />
+                    </div>
+                    <h2 className="text-3xl font-light text-white tracking-tight">Deep Search</h2>
+                    <p className="text-zinc-500 text-sm">
+                        Semantic & exact search across your entire memory bank.
+                    </p>
+                </div>
+
+                {/* Search Input */}
+                <div className="relative group">
+                    <input 
+                        type="text" 
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && performSearch(query)}
+                        placeholder="Search for moments, people, or feelings..."
+                        className="w-full bg-zinc-900/50 border border-zinc-800 text-lg px-6 py-4 rounded-2xl focus:ring-2 focus:ring-indigo-500/50 outline-none transition-all shadow-lg group-hover:bg-zinc-900"
+                    />
                     <button 
-                        onClick={() => setMode('analyst')}
-                        className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${mode === 'analyst' ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' : 'text-zinc-500 hover:text-zinc-300'}`}
+                        onClick={() => performSearch(query)}
+                        disabled={isSearching}
+                        className="absolute right-3 top-3 p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition-colors disabled:opacity-50"
                     >
-                        <Brain className="w-3.5 h-3.5" /> Analyst
-                    </button>
-                     <button 
-                        onClick={() => { setMode('mirror'); runMirrorAnalysis(); }}
-                        className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${mode === 'mirror' ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30' : 'text-zinc-500 hover:text-zinc-300'}`}
-                    >
-                        <Eye className="w-3.5 h-3.5" /> Mirror Mode
-                    </button>
-                    <button 
-                        onClick={() => { setMode('silence'); runSilenceAnalysis(); }}
-                        className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${mode === 'silence' ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' : 'text-zinc-500 hover:text-zinc-300'}`}
-                    >
-                        <Ear className="w-3.5 h-3.5" /> Silence Analysis
+                        {isSearching ? <Loader2 className="w-5 h-5 animate-spin" /> : <ArrowRight className="w-5 h-5" />}
                     </button>
                 </div>
-                
+
                 {/* Engine Status */}
-                <div className="flex items-center gap-2">
-                    {isLoadingVectors ? (
-                        <div className="flex items-center gap-2 text-xs text-yellow-500">
-                            <Loader2 className="w-3 h-3 animate-spin" />
-                            <span>Loading Engine...</span>
-                        </div>
-                    ) : vectorStore.length > 0 ? (
-                        <div className="flex items-center gap-1.5 text-xs text-emerald-500 px-2 py-1 bg-emerald-500/10 rounded border border-emerald-500/20">
-                            <Zap className="w-3 h-3 fill-current" />
-                            <span>Neural Core Active ({vectorStore.length} vectors)</span>
-                        </div>
-                    ) : (
+                {vectorStore.length === 0 && (
+                     <div className="flex flex-col items-center gap-4 py-8 border border-dashed border-zinc-800 rounded-xl bg-zinc-900/20">
+                        <p className="text-zinc-500 text-sm">Search Engine is sleeping.</p>
                         <button 
                             onClick={onInitVectors}
-                            className="flex items-center gap-1.5 text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300 px-2 py-1 rounded transition-colors"
+                            disabled={isLoadingVectors}
+                            className="flex items-center gap-2 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded-lg transition-colors text-sm"
                         >
-                            <PowerIcon className="w-3 h-3" /> Initialize Engine
+                            {isLoadingVectors ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4 text-yellow-500" />}
+                            {isLoadingVectors ? "Indexing Memories..." : "Wake up Engine"}
                         </button>
-                    )}
-                </div>
-            </div>
-
-            {/* Main Content Area */}
-            <div className="flex-1 overflow-hidden relative flex flex-col">
-                <div className="flex-1 overflow-y-auto p-4 space-y-6 custom-scrollbar">
-                    {messages.map((msg, idx) => (
-                        <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                            <div className={`max-w-[85%] md:max-w-[70%] rounded-2xl p-4 ${
-                                msg.role === 'user' 
-                                    ? 'bg-indigo-600 text-white rounded-br-none' 
-                                    : 'bg-zinc-900 border border-zinc-800 text-zinc-300 rounded-bl-none'
-                            }`}>
-                                <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
-                                {msg.usedContext && (
-                                    <div className="mt-3 pt-3 border-t border-zinc-800/50 text-[10px] text-zinc-500 flex flex-wrap gap-2">
-                                        <span className="font-semibold text-indigo-400">Sources:</span>
-                                        {Array.from(new Set(msg.usedContext)).slice(0, 3).map((s, i) => (
-                                            <span key={i} className="bg-zinc-950 px-1.5 py-0.5 rounded">{s}</span>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-                    ))}
-                    
-                    {isThinking && (
-                        <div className="flex justify-start">
-                            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 rounded-bl-none flex items-center gap-3">
-                                <div className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{animationDelay: '0ms'}}></div>
-                                <div className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{animationDelay: '150ms'}}></div>
-                                <div className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{animationDelay: '300ms'}}></div>
-                                <span className="text-xs text-zinc-500 ml-2">Neural processing...</span>
-                            </div>
-                        </div>
-                    )}
-                    <div ref={chatEndRef} />
-                </div>
-
-                {/* Prompt Grid (Only show if empty or just started) */}
-                {messages.length < 3 && mode === 'analyst' && (
-                    <div className="px-4 pb-4">
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                            {QUESTION_CATEGORIES.map(cat => (
-                                <button 
-                                    key={cat.id}
-                                    onClick={() => {
-                                        const q = cat.questions[Math.floor(Math.random() * cat.questions.length)];
-                                        setInput(q);
-                                    }}
-                                    className="text-left p-3 rounded-xl bg-zinc-900/50 hover:bg-zinc-800 border border-zinc-800 transition-all group"
-                                >
-                                    <div className={`flex items-center gap-2 mb-1 ${cat.color}`}>
-                                        <cat.icon className="w-4 h-4" />
-                                        <span className="text-xs font-semibold">{cat.label}</span>
-                                    </div>
-                                    <div className="text-xs text-zinc-500 group-hover:text-zinc-300 truncate">
-                                        e.g. {cat.questions[0]}
-                                    </div>
-                                </button>
-                            ))}
-                        </div>
                     </div>
                 )}
 
-                {/* Input Area */}
-                <div className="p-4 bg-zinc-950 border-t border-zinc-900">
-                    <div className="relative max-w-4xl mx-auto">
-                        <input
-                            type="text"
-                            value={input}
-                            onChange={(e) => setInput(e.target.value)}
-                            onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSendMessage()}
-                            placeholder={vectorStore.length === 0 ? "Initialize Engine to start..." : "Ask your Neural Analyst..."}
-                            disabled={vectorStore.length === 0 || isThinking}
-                            className="w-full bg-zinc-900 text-zinc-100 rounded-xl pl-4 pr-12 py-3.5 focus:ring-2 focus:ring-indigo-500/50 outline-none border border-zinc-800 placeholder-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed"
-                        />
-                        <button 
-                            onClick={handleSendMessage}
-                            disabled={!input.trim() || vectorStore.length === 0 || isThinking}
-                            className="absolute right-2 top-2 p-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors disabled:opacity-0 disabled:pointer-events-none"
+                {/* Results List */}
+                <div className="space-y-4 pb-20">
+                    {results.map((res, idx) => (
+                        <div 
+                            key={`${res.item.id}_${idx}`}
+                            onClick={() => onNavigateToMemory(res.item.meta.originalId || res.item.id, query)}
+                            className="bg-zinc-900/50 border border-zinc-800 hover:border-indigo-500/30 p-5 rounded-xl cursor-pointer group transition-all hover:bg-zinc-900"
                         >
-                            <Sparkles className="w-5 h-5" />
-                        </button>
-                    </div>
+                            <div className="flex justify-between items-start mb-2">
+                                <div className="flex items-center gap-2">
+                                    <FileText className="w-4 h-4 text-zinc-500 group-hover:text-indigo-400 transition-colors" />
+                                    <span className="text-xs font-mono text-zinc-500">{res.item.meta.source}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <span className="text-[10px] text-zinc-600">{new Date(res.item.meta.timestamp).toLocaleDateString()}</span>
+                                    {res.score > 0.8 && <span className="text-[10px] bg-emerald-500/10 text-emerald-400 px-1.5 rounded">High Match</span>}
+                                </div>
+                            </div>
+                            
+                            <p className="text-sm text-zinc-300 leading-relaxed font-serif opacity-90">
+                                {highlightText(res.snippet, query)}
+                            </p>
+                        </div>
+                    ))}
+                    
+                    {results.length === 0 && query && !isSearching && vectorStore.length > 0 && (
+                        <div className="text-center text-zinc-600 py-10">
+                            No matching memories found.
+                        </div>
+                    )}
                 </div>
-            </div>
+             </div>
         </div>
-    );
-};
+    )
+}
 
 // Journal Component
 const JournalEditor = ({ memories, onSave }: { memories: MemoryItem[], onSave: (item: MemoryItem) => Promise<boolean> }) => {
@@ -1361,29 +897,23 @@ const JournalEditor = ({ memories, onSave }: { memories: MemoryItem[], onSave: (
     const [lastSaved, setLastSaved] = useState<Date | null>(null);
     const [dateStr, setDateStr] = useState("");
 
-    // Initialize logic
     useEffect(() => {
         const today = new Date().toISOString().split('T')[0];
         setDateStr(today);
-        
-        // Find existing
         const id = `journal_${today}`;
         const existing = memories.find(m => m.id === id);
-        
         if (existing && existing.content) {
             setEntry(existing.content.entry || "");
             setMood(existing.content.mood || "");
         }
     }, [memories]);
 
-    // Auto-save logic
     useEffect(() => {
         const timer = setTimeout(() => {
             if (entry.trim()) {
                 handleSave();
             }
-        }, 3000); // 3 seconds debounced auto-save
-        
+        }, 3000); 
         return () => clearTimeout(timer);
     }, [entry, mood]);
 
@@ -1402,7 +932,6 @@ const JournalEditor = ({ memories, onSave }: { memories: MemoryItem[], onSave: (
                 mood: mood
             }
         };
-
         const success = await onSave(item);
         if(success) {
             setLastSaved(new Date());
@@ -1412,7 +941,6 @@ const JournalEditor = ({ memories, onSave }: { memories: MemoryItem[], onSave: (
 
     return (
         <div className="h-full flex flex-col max-w-3xl mx-auto p-4 md:p-8 animate-fade-in">
-            {/* Header */}
             <div className="flex items-center justify-between mb-8">
                 <div>
                      <h2 className="text-3xl font-light text-white tracking-tight">
@@ -1433,7 +961,6 @@ const JournalEditor = ({ memories, onSave }: { memories: MemoryItem[], onSave: (
                 </div>
             </div>
 
-            {/* Mood Selector */}
             <div className="flex gap-2 mb-6 overflow-x-auto pb-2 no-scrollbar">
                 {MOODS.map(m => (
                     <button
@@ -1446,7 +973,6 @@ const JournalEditor = ({ memories, onSave }: { memories: MemoryItem[], onSave: (
                 ))}
             </div>
 
-            {/* Editor */}
             <div className="flex-1 relative group">
                 <textarea 
                     value={entry}
@@ -1463,37 +989,20 @@ const JournalEditor = ({ memories, onSave }: { memories: MemoryItem[], onSave: (
     );
 };
 
-// Simple Icon component for the button
-const PowerIcon = (props: any) => (
-    <svg 
-      xmlns="http://www.w3.org/2000/svg" 
-      width="24" 
-      height="24" 
-      viewBox="0 0 24 24" 
-      fill="none" 
-      stroke="currentColor" 
-      strokeWidth="2" 
-      strokeLinecap="round" 
-      strokeLinejoin="round" 
-      {...props}
-    >
-      <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
-      <line x1="12" x2="12" y1="2" y2="12" />
-    </svg>
-)
-
 // --- Main App Component ---
 
 function App() {
-  const [activeView, setActiveView] = useState<'upload' | 'memories' | 'analytics' | 'intelligence' | 'journal' | 'settings'>('upload');
+  const [activeView, setActiveView] = useState<'upload' | 'memories' | 'analytics' | 'search' | 'journal' | 'settings'>('upload');
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   
-  // Authorization State for Google AI Studio Environment
-  const [hasApiAccess, setHasApiAccess] = useState(false);
-  
-  // Vector Store State (Shared between Analytics and Intelligence)
+  // Search Navigation State
+  const [searchQuery, setSearchQuery] = useState("");
+  const [expandedMemoryId, setExpandedMemoryId] = useState<string | null>(null);
+  const [highlightTerm, setHighlightTerm] = useState<string>("");
+
+  // Vector Store State
   const [vectorStore, setVectorStore] = useState<VectorItem[]>([]);
   const [isLoadingVectors, setIsLoadingVectors] = useState(false);
 
@@ -1507,23 +1016,6 @@ function App() {
       enabled: false
   });
 
-  // --- API Key Authorization Check ---
-  useEffect(() => {
-    async function checkApiKey() {
-      // If we are in the Google AI Studio environment, we must check for the selected key
-      // Fix: Cast window to any to access aistudio to avoid type conflict
-      if (typeof window !== 'undefined' && (window as any).aistudio) {
-        const hasKey = await (window as any).aistudio.hasSelectedApiKey();
-        setHasApiAccess(hasKey);
-      } else {
-        // If not in that specific environment, assume process.env.API_KEY is handled by the build system/env
-        setHasApiAccess(true);
-      }
-    }
-    checkApiKey();
-  }, []);
-
-  // --- Toast Logic ---
   const addToast = (type: ToastType, title: string, message: string) => {
     const id = Date.now().toString();
     setToasts(prev => [...prev, { id, type, title, message }]);
@@ -1532,9 +1024,7 @@ function App() {
     }, 5000);
   };
 
-  // --- Initialization ---
   useEffect(() => {
-    // Load local settings
     const savedName = localStorage.getItem("memory_os_name");
     const savedSupabase = localStorage.getItem("memory_os_supabase");
 
@@ -1544,8 +1034,6 @@ function App() {
             setSupabaseConfig(JSON.parse(savedSupabase));
         } catch(e) {}
     }
-
-    // Load Data
     loadData();
   }, []);
 
@@ -1567,7 +1055,6 @@ function App() {
     let failCount = 0;
 
     addToast('info', 'Processing', `Reading ${files.length} files...`);
-
     const newItems: MemoryItem[] = [];
 
     for (const file of files) {
@@ -1585,8 +1072,8 @@ function App() {
     if (newItems.length > 0) {
         try {
             await saveMemories(newItems, supabaseConfig.enabled ? supabaseConfig : undefined);
-            setMemories(prev => [...prev, ...newItems]); // Optimistic update
-            addToast('success', 'Import Complete', `Imported ${successCount} files. ${failCount > 0 ? `${failCount} failed.` : ''}`);
+            setMemories(prev => [...prev, ...newItems]); 
+            addToast('success', 'Import Complete', `Imported ${successCount} files.`);
             setActiveView('memories');
         } catch (e) {
             addToast('error', 'Save Failed', (e as Error).message);
@@ -1610,7 +1097,6 @@ function App() {
         });
         return true;
       } catch (e) {
-          console.error("Save failed", e);
           addToast('error', 'Save Failed', (e as Error).message);
           return false;
       }
@@ -1621,27 +1107,24 @@ function App() {
       try {
           await clearMemories(supabaseConfig.enabled ? supabaseConfig : undefined);
           setMemories([]);
-          setVectorStore([]); // Clear vectors too
+          setVectorStore([]); 
           addToast('success', 'Cleared', 'All memories deleted.');
       } catch (e) {
           addToast('error', 'Error', (e as Error).message);
       }
   };
 
-  // --- Shared Vector Initialization ---
+  // --- Optimized Vector Initialization (Background Yielding) ---
   const initializeEngine = async () => {
-      if (vectorStore.length > 0) return; // Already loaded
+      if (vectorStore.length > 0) return; 
       setIsLoadingVectors(true);
       try {
           const pipe = await loadEmbeddingModel();
-          
-          // Process memories into chunks
           const chunks: VectorItem[] = [];
           
           memories.forEach(mem => {
               if (mem.type === 'conversation') {
                   const msgs = Array.isArray(mem.content) ? mem.content : mem.content?.messages || [];
-                  // Group by 20 messages
                   for (let i = 0; i < msgs.length; i += 20) {
                       const batch = msgs.slice(i, i + 20);
                       const text = batch.map((m: any) => `${m.sender}: ${m.message}`).join('\n');
@@ -1653,7 +1136,8 @@ function App() {
                               meta: { 
                                   source: mem.sourceFile, 
                                   timestamp: msgs[i]?.date || mem.timestamp,
-                                  sender: batch[0]?.sender // Primary sender hint
+                                  sender: batch[0]?.sender,
+                                  originalId: mem.id
                               }
                           });
                       }
@@ -1663,28 +1147,30 @@ function App() {
                       id: mem.id,
                       text: mem.content.entry,
                       embedding: [],
-                      meta: { source: 'Journal', timestamp: mem.timestamp }
+                      meta: { source: 'Journal', timestamp: mem.timestamp, originalId: mem.id }
                   });
               }
           });
 
           console.log(`Embedding ${chunks.length} chunks...`);
-          addToast('info', 'Neural Core', `Embedding ${chunks.length} memory chunks...`);
+          addToast('info', 'Neural Core', `Indexing ${chunks.length} chunks in background...`);
           
           const vectors: VectorItem[] = [];
+          // Aggressive yielding: Process 1, wait 10ms. 
+          // This ensures the main thread is never blocked for UI interactions.
           for (let i = 0; i < chunks.length; i++) {
               const output = await pipe(chunks[i].text, { pooling: 'mean', normalize: true });
               vectors.push({
                   ...chunks[i],
                   embedding: Array.from(output.data) as number[]
               });
-              // Yield to UI every 10 items
-              if (i % 10 === 0) await new Promise(r => setTimeout(r, 0));
+              // Force yield to main thread to prevent freeze
+              await new Promise(r => setTimeout(r, 10)); 
           }
 
           setVectorStore(vectors);
           setIsLoadingVectors(false);
-          addToast('success', 'Neural Core Ready', 'You can now use Semantic Search and AI features.');
+          addToast('success', 'Engine Ready', 'Deep Search is active.');
       } catch (e) {
           console.error(e);
           setIsLoadingVectors(false);
@@ -1692,7 +1178,128 @@ function App() {
       }
   };
 
-  // --- Views ---
+  // --- View Rendering ---
+
+  const MemoriesView = () => {
+      const scrollRef = useRef<HTMLDivElement>(null);
+
+      // Auto-scroll to highlight when opening a specific memory
+      useEffect(() => {
+          if (expandedMemoryId && highlightTerm && scrollRef.current) {
+               // Give DOM time to render
+               setTimeout(() => {
+                   const elements = scrollRef.current?.querySelectorAll("div[data-message-text]");
+                   if (elements) {
+                       for(let i=0; i<elements.length; i++) {
+                           if(elements[i].textContent?.toLowerCase().includes(highlightTerm.toLowerCase())) {
+                               elements[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                               break;
+                           }
+                       }
+                   }
+               }, 500);
+          }
+      }, [expandedMemoryId, highlightTerm]);
+
+      // If viewing a single memory file
+      if (expandedMemoryId) {
+          const mem = memories.find(m => m.id === expandedMemoryId);
+          if (!mem) return <div>Memory not found</div>;
+
+          return (
+              <div className="p-4 md:p-8 h-full overflow-y-auto custom-scrollbar bg-zinc-950" ref={scrollRef}>
+                  <div className="max-w-3xl mx-auto">
+                      <button 
+                          onClick={() => setExpandedMemoryId(null)}
+                          className="flex items-center gap-2 text-zinc-500 hover:text-white mb-6 transition-colors"
+                      >
+                          <ArrowRight className="w-4 h-4 rotate-180" /> Back to list
+                      </button>
+                      
+                      <h2 className="text-2xl font-light text-white mb-2">{mem.sourceFile.replace('.json', '')}</h2>
+                      <div className="text-xs text-zinc-600 font-mono mb-8">{new Date(mem.timestamp).toLocaleDateString()}</div>
+
+                      <div className="space-y-4 font-serif text-lg leading-relaxed text-zinc-300">
+                          {mem.type === 'conversation' && Array.isArray(mem.content) ? (
+                              mem.content.map((msg: any, i: number) => (
+                                  <div 
+                                    key={i} 
+                                    className={`p-3 rounded-xl ${msg.sender === 'Unknown' ? 'bg-zinc-900/50' : (USER_ALIASES.has(msg.sender?.toLowerCase()) ? 'bg-indigo-900/20 ml-auto max-w-[80%]' : 'bg-zinc-900 mr-auto max-w-[80%]')}`}
+                                    data-message-text="true"
+                                  >
+                                      <div className="text-xs text-zinc-500 mb-1">{msg.sender}</div>
+                                      <div>
+                                          {msg.message.split(new RegExp(`(${highlightTerm})`, 'gi')).map((part: string, idx: number) => 
+                                              part.toLowerCase() === highlightTerm.toLowerCase() && highlightTerm
+                                              ? <span key={idx} className="bg-yellow-500/40 text-yellow-100 rounded px-1">{part}</span> 
+                                              : part
+                                          )}
+                                      </div>
+                                  </div>
+                              ))
+                          ) : (
+                              <div className="whitespace-pre-wrap">
+                                  {JSON.stringify(mem.content, null, 2)}
+                              </div>
+                          )}
+                      </div>
+                  </div>
+              </div>
+          )
+      }
+
+      // List View
+      return (
+          <div className="p-4 md:p-8 h-full overflow-y-auto custom-scrollbar">
+            <h2 className="text-2xl font-light mb-6 sticky top-0 bg-zinc-950/80 backdrop-blur-md py-4 z-10 flex items-center justify-between">
+                <span>Memory Stream</span>
+                <span className="text-xs font-mono bg-zinc-900 px-2 py-1 rounded text-zinc-500">{memories.length} items</span>
+            </h2>
+            
+            {memories.length === 0 ? (
+                <div className="text-center text-zinc-500 mt-20">
+                    <Ghost className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                    No memories found. Go to Upload.
+                </div>
+            ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-20">
+                {memories.slice().reverse().map((mem) => (
+                    <div 
+                        key={mem.id} 
+                        onClick={() => setExpandedMemoryId(mem.id)}
+                        className="group bg-zinc-900/50 border border-zinc-800/50 p-5 rounded-xl hover:border-indigo-500/30 transition-all hover:bg-zinc-900 relative overflow-hidden cursor-pointer"
+                    >
+                        <div className="flex items-start justify-between mb-3">
+                            <div className="flex items-center gap-2">
+                                {mem.type === 'conversation' && <MessageCircle className="w-4 h-4 text-blue-400" />}
+                                {mem.type === 'person' && <User className="w-4 h-4 text-purple-400" />}
+                                {mem.type === 'journal' && <BookOpen className="w-4 h-4 text-emerald-400" />}
+                                {mem.type === 'emotion' && <Heart className="w-4 h-4 text-rose-400" />}
+                                {(mem.type === 'text' || mem.type === 'unknown' || !mem.type) && <FileText className="w-4 h-4 text-zinc-400" />}
+                                <span className="text-xs font-medium text-zinc-400 truncate max-w-[150px]">
+                                    {mem.sourceFile.replace('.json', '')}
+                                </span>
+                            </div>
+                            <span className="text-[10px] text-zinc-600 font-mono">
+                                {new Date(mem.timestamp).toLocaleDateString()}
+                            </span>
+                        </div>
+                        
+                        <div className="text-sm text-zinc-300 line-clamp-4 leading-relaxed opacity-80 group-hover:opacity-100">
+                            {mem.type === 'conversation' 
+                                ? (Array.isArray(mem.content) 
+                                    ? mem.content.slice(0, 3).map((m:any) => `${m.sender}: ${m.message}`).join('\n') 
+                                    : "Chat Log")
+                                : (typeof mem.content === 'string' ? mem.content : JSON.stringify(mem.content, null, 2))
+                            }
+                        </div>
+                    </div>
+                ))}
+                </div>
+            )}
+          </div>
+      );
+  };
 
   const renderContent = () => {
     switch (activeView) {
@@ -1719,7 +1326,6 @@ function App() {
                 onChange={handleFileUpload} 
               />
             </label>
-            
             <div className="text-xs text-zinc-600 mt-8">
                 Supports: WhatsApp Export (.txt), JSON Schema, Plain Text
             </div>
@@ -1727,72 +1333,31 @@ function App() {
         );
 
       case 'memories':
-        return (
-          <div className="p-4 md:p-8 h-full overflow-y-auto custom-scrollbar">
-            <h2 className="text-2xl font-light mb-6 sticky top-0 bg-zinc-950/80 backdrop-blur-md py-4 z-10 flex items-center justify-between">
-                <span>Memory Stream</span>
-                <span className="text-xs font-mono bg-zinc-900 px-2 py-1 rounded text-zinc-500">{memories.length} items</span>
-            </h2>
-            
-            {memories.length === 0 ? (
-                <div className="text-center text-zinc-500 mt-20">
-                    <Ghost className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                    No memories found. Go to Upload.
-                </div>
-            ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-20">
-                {memories.slice().reverse().map((mem) => (
-                    <div key={mem.id} className="group bg-zinc-900/50 border border-zinc-800/50 p-5 rounded-xl hover:border-indigo-500/30 transition-all hover:bg-zinc-900 relative overflow-hidden">
-                    <div className="flex items-start justify-between mb-3">
-                        <div className="flex items-center gap-2">
-                             {mem.type === 'conversation' && <MessageCircle className="w-4 h-4 text-blue-400" />}
-                             {mem.type === 'person' && <User className="w-4 h-4 text-purple-400" />}
-                             {mem.type === 'journal' && <BookOpen className="w-4 h-4 text-emerald-400" />}
-                             {mem.type === 'emotion' && <Heart className="w-4 h-4 text-rose-400" />}
-                             {(mem.type === 'text' || mem.type === 'unknown' || !mem.type) && <FileText className="w-4 h-4 text-zinc-400" />}
-                             <span className="text-xs font-medium text-zinc-400 truncate max-w-[150px]">
-                                {mem.sourceFile.replace('.json', '')}
-                             </span>
-                        </div>
-                        <span className="text-[10px] text-zinc-600 font-mono">
-                            {new Date(mem.timestamp).toLocaleDateString()}
-                        </span>
-                    </div>
-                    
-                    <div className="text-sm text-zinc-300 line-clamp-4 leading-relaxed opacity-80 group-hover:opacity-100">
-                        {mem.type === 'conversation' 
-                            ? (Array.isArray(mem.content) 
-                                ? mem.content.slice(0, 3).map((m:any) => `${m.sender}: ${m.message}`).join('\n') 
-                                : "Chat Log")
-                            : (typeof mem.content === 'string' ? mem.content : JSON.stringify(mem.content, null, 2))
-                        }
-                    </div>
-                    
-                    <div className="absolute bottom-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-indigo-500/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
-                    </div>
-                ))}
-                </div>
-            )}
-          </div>
-        );
+        return <MemoriesView />;
 
       case 'analytics':
           return (
             <AnalyticsDashboard 
                 memories={memories} 
-                vectorStore={vectorStore} 
-                onInitVectors={initializeEngine} 
-                isLoadingVectors={isLoadingVectors} 
+                onWordClick={(word) => {
+                    setSearchQuery(word);
+                    setActiveView('search');
+                }}
             />
           );
 
-      case 'intelligence':
+      case 'search':
         return (
-            <NeuralAnalyst 
-                memories={memories} 
+            <DeepSearch 
                 vectorStore={vectorStore} 
                 onInitVectors={initializeEngine} 
                 isLoadingVectors={isLoadingVectors} 
+                initialQuery={searchQuery}
+                onNavigateToMemory={(id, highlight) => {
+                    setExpandedMemoryId(id);
+                    setHighlightTerm(highlight);
+                    setActiveView('memories');
+                }}
             />
         );
 
@@ -1805,9 +1370,7 @@ function App() {
              <h2 className="text-2xl font-light mb-8 flex items-center gap-2">
                  <Settings className="w-6 h-6" /> System Configuration
              </h2>
-             
              <div className="space-y-8">
-                 {/* User Profile */}
                  <div className="bg-zinc-900/50 p-6 rounded-2xl border border-zinc-800">
                      <h3 className="text-lg font-medium mb-4 flex items-center gap-2">
                          <User className="w-4 h-4 text-indigo-400" /> Identity
@@ -1827,7 +1390,6 @@ function App() {
                          </div>
                      </div>
                  </div>
-
                  {/* Cloud Sync */}
                  <div className="bg-zinc-900/50 p-6 rounded-2xl border border-zinc-800 relative overflow-hidden">
                      <div className="absolute top-0 right-0 p-4 opacity-10">
@@ -1891,8 +1453,6 @@ function App() {
                          )}
                      </div>
                  </div>
-
-                 {/* Danger Zone */}
                  <div className="bg-red-950/10 p-6 rounded-2xl border border-red-900/30">
                      <h3 className="text-lg font-medium mb-4 flex items-center gap-2 text-red-400">
                          <AlertTriangle className="w-4 h-4" /> Danger Zone
@@ -1912,42 +1472,6 @@ function App() {
         return null;
     }
   };
-
-  // Render API Key Selection Screen if needed
-  if (!hasApiAccess && typeof window !== 'undefined' && (window as any).aistudio) {
-    return (
-        <div className="flex flex-col items-center justify-center h-screen bg-zinc-950 text-white space-y-6 animate-fade-in p-6">
-            <div className="w-16 h-16 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
-                <Brain className="w-8 h-8 text-white" />
-            </div>
-            <h1 className="text-2xl font-light tracking-tight text-center">Memory OS</h1>
-            <p className="text-zinc-400 text-sm max-w-xs text-center leading-relaxed">
-                To activate your external brain and neural analysis, please connect your Google Gemini API key.
-            </p>
-            <button 
-                onClick={async () => {
-                    // Fix: Cast window to any to access aistudio
-                    const win = window as any;
-                    if (win.aistudio) {
-                        await win.aistudio.openSelectKey();
-                        const has = await win.aistudio.hasSelectedApiKey();
-                        if(has) {
-                            setHasApiAccess(true);
-                            window.location.reload(); 
-                        }
-                    }
-                }}
-                className="flex items-center gap-2 px-6 py-3 bg-white text-black rounded-full font-medium hover:scale-105 transition-transform shadow-xl shadow-white/10"
-            >
-                <Zap className="w-4 h-4 fill-black" />
-                Connect API Key
-            </button>
-            <a href="https://ai.google.dev/" target="_blank" className="text-xs text-zinc-600 hover:text-zinc-400 transition-colors">
-                What is this?
-            </a>
-        </div>
-    )
-  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-zinc-950 text-zinc-200 font-sans selection:bg-indigo-500/30">
@@ -1996,11 +1520,11 @@ function App() {
                 <span className="text-sm font-medium">Analytics</span>
             </button>
              <button 
-                onClick={() => { setActiveView('intelligence'); setIsSidebarOpen(false); }}
-                className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${activeView === 'intelligence' ? 'bg-zinc-900 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900/50'}`}
+                onClick={() => { setActiveView('search'); setIsSidebarOpen(false); }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${activeView === 'search' ? 'bg-zinc-900 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900/50'}`}
             >
-                <Brain className="w-5 h-5" />
-                <span className="text-sm font-medium">Neural Analyst</span>
+                <Search className="w-5 h-5" />
+                <span className="text-sm font-medium">Deep Search</span>
             </button>
             <button 
                 onClick={() => { setActiveView('journal'); setIsSidebarOpen(false); }}
@@ -2020,7 +1544,7 @@ function App() {
                 <span className="text-sm font-medium">Settings</span>
             </button>
             <div className="mt-4 px-4 text-[10px] text-zinc-600 font-mono text-center">
-                v1.2.1 • Local First
+                v1.3.0 • Local Intelligence
             </div>
         </div>
       </aside>
